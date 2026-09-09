@@ -355,6 +355,7 @@
   @media (max-width:980px){ .grid-2, .grid-3{ grid-template-columns:1fr; } }
 
   .card{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); animation:cardIn .22s ease; }
+  body.no-card-anim .card{ animation:none; }
   @keyframes cardIn{ from{ opacity:0; transform:translateY(4px); } to{ opacity:1; transform:none; } }
   @media (max-width:900px){
     .nav-item{ padding:12px 12px; font-size:14px; }
@@ -966,6 +967,7 @@ const SUPABASE_URL = 'https://jzguvhfapnkkmgpdyzof.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp6Z3V2aGZhcG5ra21ncGR5em9mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg3ODgxMTgsImV4cCI6MjEwNDM2NDExOH0.mvwwoNInY1pN9tB-KVdZj4wknnQgTYLqqJCiL9nt5gk';
 let _remoteUpdatedAt = null;
 let _saveTimer = null;
+let _saveRetryTimer = null;
 let _syncing = false;
 /* Dernier état qu'on SAIT synchronisé avec le serveur (juste après un chargement ou une
    sauvegarde réussie). Sert de référence pour distinguer "j'ai modifié ce champ" de
@@ -1062,6 +1064,19 @@ async function fetchRemoteState(){
 }
 const SYNC_ARRAY_KEYS = ['USERS','DEPARTMENTS','PROJECTS','TASKS','OBJECTIVES','NOTIFICATIONS','MESSAGES','MEETINGS','POSTS','DAY_REPORTS'];
 const SYNC_OBJECT_KEYS = ['WEIGHTS','PLAN_STATUS','PLAN_DAY','MSG_READ','FEED_SEEN'];
+/* Vrai si l'état local a divergé de la dernière copie qu'on sait synchronisée avec le serveur.
+   Sert de garde à render() pour ne programmer une sauvegarde QUE quand quelque chose a
+   réellement changé -- sans ça, render() appelait scheduleSave() à chaque rendu, y compris ceux
+   déclenchés par mergeAndSave()/pollTick() eux-mêmes (qui ré-affichent après avoir déjà tout
+   synchronisé), créant une boucle perpétuelle rendu → sauvegarde → rendu qui se manifestait par
+   un scintillement de l'interface toutes les ~1 seconde. */
+function stateDirty(){
+  if(!_lastSyncedSnapshot) return true;
+  const cur = collectState();
+  for(const k of SYNC_ARRAY_KEYS){ if(_stableJSON(cur[k]) !== _stableJSON(_lastSyncedSnapshot[k])) return true; }
+  for(const k of SYNC_OBJECT_KEYS){ if(_stableJSON(cur[k]) !== _stableJSON(_lastSyncedSnapshot[k])) return true; }
+  return false;
+}
 /* Remplace le simple "écraser tout le blob distant" (saveStateRemote) par une vraie fusion :
    on relit l'état distant courant, on fusionne chaque tableau par id (au lieu d'un last-write-wins
    sur l'ensemble du blob) puis on ré-applique le résultat fusionné en local ET on le sauvegarde.
@@ -1075,6 +1090,13 @@ const SYNC_OBJECT_KEYS = ['WEIGHTS','PLAN_STATUS','PLAN_DAY','MSG_READ','FEED_SE
    renomment le même projet en même temps). */
 async function mergeAndSave(attempt){
   attempt = attempt||0;
+  /* Le timer déclenché par scheduleSave() a fait son travail dès qu'on entre ici : on le
+     réinitialise immédiatement à null. Sans ça, _saveTimer restait pour toujours "vrai" (le
+     handle expiré d'un setTimeout déjà exécuté n'est jamais remis à null ailleurs), ce qui
+     bloquait silencieusement et DÉFINITIVEMENT pollTick() (garde `if(_saveTimer) return false;`)
+     dès la toute première sauvegarde de la session -- empêchant ensuite ce navigateur de jamais
+     revoir les changements des autres utilisateurs sans un rechargement complet de la page. */
+  if(attempt===0) _saveTimer = null;
   try{
     _syncing = true;
     const local = collectState();
@@ -1094,16 +1116,44 @@ async function mergeAndSave(attempt){
     applyState(merged);
     const now = new Date().toISOString();
     const casFilter = (remoteState && remoteState.updated_at) ? `id=eq.main&updated_at=eq.${encodeURIComponent(remoteState.updated_at)}` : `id=eq.main`;
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?${casFilter}&select=updated_at`, {
-      method:'PATCH',
-      headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':'application/json', 'Prefer':'return=representation' },
-      body: JSON.stringify({ data: merged, updated_at: now }),
-    });
+    let res, netErr = null;
+    try{
+      res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?${casFilter}&select=updated_at`, {
+        method:'PATCH',
+        headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':'application/json', 'Prefer':'return=representation' },
+        body: JSON.stringify({ data: merged, updated_at: now }),
+      });
+    }catch(e){ netErr = e; }
+    /* Échec réseau, ou réponse HTTP en erreur (ex. 409/500) : on ne considère JAMAIS ça comme
+       une sauvegarde réussie. On réessaie plus tard (avec un backoff) sans toucher à
+       _lastSyncedSnapshot -- l'état local (déjà fusionné, donc jamais pire que ce qu'on avait)
+       restera détecté comme "non synchronisé" par render()/stateDirty(), qui reprogrammera
+       naturellement une sauvegarde dès qu'une nouvelle interaction ou un prochain cycle a lieu. */
+    if(netErr || !res || !res.ok){
+      console.warn('TeamFlow sync (save) impossible :', netErr || (res && res.status));
+      if(S.user) render();
+      _syncing = false;
+      _saveRetryTimer && clearTimeout(_saveRetryTimer);
+      _saveRetryTimer = setTimeout(()=>scheduleSave(), 3000);
+      return;
+    }
     let rows = [];
     try{ rows = await res.json(); }catch(e){}
-    if(Array.isArray(rows) && rows.length===0 && attempt<5){
+    if(Array.isArray(rows) && rows.length===0){
+      if(attempt<5){
+        _syncing = false;
+        return mergeAndSave(attempt+1); // quelqu'un d'autre a écrit entretemps : on relit et refusionne
+      }
+      /* Conflits d'écriture concurrente répétés (CAS jamais gagné) : on abandonne CETTE tentative
+         sans marquer l'état comme synchronisé (le blob distant n'a, de fait, pas été modifié).
+         On reprogramme un nouvel essai un peu plus tard au lieu de perdre silencieusement les
+         changements locaux (qui restent en mémoire et seront re-fusionnés au prochain essai). */
+      console.warn('TeamFlow sync (save) : conflits répétés, nouvel essai programmé.');
+      if(S.user) render();
       _syncing = false;
-      return mergeAndSave(attempt+1); // quelqu'un d'autre a écrit entretemps : on relit et refusionne
+      _saveRetryTimer && clearTimeout(_saveRetryTimer);
+      _saveRetryTimer = setTimeout(()=>scheduleSave(), 2000);
+      return;
     }
     _remoteUpdatedAt = now;
     /* Clone profond indispensable : applyState() ci-dessus a fait pointer TASKS/NOTIFICATIONS/...
@@ -1703,7 +1753,7 @@ function renderTaskCard(t){
       ${S.user.role!=='collab' && t.assignee!==S.user.id ? avatarHTML(userByIdSafe(t.assignee),30,11) : ''}
       <div class="prio prio-${t.priority}"></div>
       <div style="flex:1;">
-        <div class="task-title">${t.title} ${t.assignedByManager?'<span class="pill pill-info" style="margin-left:4px;">Assignée</span>':''} ${t.recurring?'<span class="pill pill-muted" style="margin-left:4px;">🔁 Récurrente</span>':''} ${t.approval==='pending'?'<span class="pill pill-warn" style="margin-left:4px;">⏳ À valider</span>':''}</div>
+        <div class="task-title">${t.title} ${t.assignedByManager?'<span class="pill pill-info" style="margin-left:4px;">Assignée</span>':''} ${t.recurring?'<span class="pill pill-muted" style="margin-left:4px;">🔁 Récurrente</span>':''} ${t.approval==='pending'?'<span class="pill pill-warn" style="margin-left:4px;">⏳ À valider</span>':t.approval==='approved'?'<span class="pill pill-success" style="margin-left:4px;">✅ Validée</span>':t.approval==='rejected'?'<span class="pill pill-crit" style="margin-left:4px;">🚫 Rejetée</span>':''}</div>
         <div class="task-meta">
           <span class="pill pill-muted">${t.category}</span>
           <span>${priorityLabel(t.priority)}</span>
@@ -1712,6 +1762,7 @@ function renderTaskCard(t){
           ${proj?`<span class="pill pill-accent">🚀 ${proj.name}</span>`:''}
           ${S.user.role!=='collab' && t.assignee!==S.user.id ? `<span class="pill pill-muted">${userByIdSafe(t.assignee).name}</span>`:''}
         </div>
+        ${t.description?`<div style="font-size:11.5px; color:var(--text-muted); margin-top:3px;">${escapeHtml(t.description)}</div>`:''}
         ${t.status==='En retard'?`<div style="font-size:11.5px; color:var(--crit); margin-top:3px;">⚠️ Échéance dépassée de ${lateLbl}${t.carriedOver?' · reportée automatiquement':''}</div>`:''}
         ${t.status==='Bloquée' && t.blockReason?`<div style="font-size:11.5px; color:var(--crit); margin-top:3px;">Blocage : ${t.blockReason}</div>`:''}
         ${t.status==='En pause' && t.pauseReason?`<div style="font-size:11.5px; color:var(--warn); margin-top:3px;">En pause : ${t.pauseReason}</div>`:''}
@@ -1783,7 +1834,7 @@ function confirmAddActivity(){
   const proj = PROJECTS.find(p=>p.id===projId);
   const day = PLAN_DAY[S.user.id] || todayISO();
   const newId = uid('t');
-  TASKS.push({id:newId, title, category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
+  TASKS.push({id:newId, title, description:document.getElementById('naDesc').value.trim(), category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
     assignee:S.user.id, project:projId, phase:proj.currentPhase, duration:document.getElementById('naDur').value||'1h',
     date:day, deadline:day, deadlineTime:document.getElementById('naDeadlineTime').value||WORK_END, status:'À faire', deliverables:[], comments:[],
     expectedDeliverable:document.getElementById('naDeliv').value, approval:'pending'});
@@ -1915,6 +1966,7 @@ function openTaskDetail(id){
   <div class="modal-body">
     <div class="task-meta" style="margin-bottom:12px;">${statusPill(t.status)}<span class="pill pill-muted">${t.category}</span><span>${priorityLabel(t.priority)}</span>${proj?`<span class="pill pill-accent">🚀 ${proj.name}</span>`:''}${t.approval==='pending'?'<span class="pill pill-warn">⏳ À valider</span>':t.approval==='approved'?'<span class="pill pill-success">✅ Validée</span>':t.approval==='rejected'?'<span class="pill pill-crit">🚫 Rejetée</span>':''}</div>
     <div style="display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-muted); margin-bottom:14px;">${avatarHTML(userByIdSafe(t.assignee),22,9)}Assignée à <b>${userByIdSafe(t.assignee).name}</b> · Échéance ${fmtDate(t.deadline)}</div>
+    ${t.description?`<div style="font-size:13px; background:var(--surface-2); border-radius:10px; padding:10px 12px; margin-bottom:12px; white-space:pre-wrap;">${escapeHtml(t.description)}</div>`:''}
     ${t.deliverables.length?`<h4 style="font-size:12px; text-transform:uppercase; color:var(--text-muted); margin:0 0 8px;">Livrables</h4>${t.deliverables.map(d=>`<div class="pill pill-muted" style="margin:0 6px 6px 0;">📎 ${d.name}</div>`).join('')}`:''}
     ${canApprove?`<div style="margin:14px 0; padding:12px; border:1px dashed var(--warn); border-radius:10px; background:var(--warn-bg);">
       <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase; letter-spacing:.05em;">Activité déclarée par le collaborateur — à valider</div>
@@ -2890,7 +2942,7 @@ function viewNotifications(){
   <div class="card" style="margin-bottom:22px;">${pending.length? pending.map(t=>`
     <div class="notif-row" style="cursor:pointer;" onclick="openTaskDetail('${t.id}')">
       ${avatarHTML(userByIdSafe(t.assignee),34,12)}
-      <div style="flex:1;"><div style="font-size:13px;"><b>${userByIdSafe(t.assignee).name}</b> — ${t.title}</div><div style="font-size:11px; color:var(--text-faint); margin-top:3px;">${fmtDate(t.date)} · ${t.category}</div></div>
+      <div style="flex:1;"><div style="font-size:13px;"><b>${userByIdSafe(t.assignee).name}</b> — ${t.title}</div><div style="font-size:11px; color:var(--text-faint); margin-top:3px;">${fmtDate(t.date)} · ${t.category}</div>${t.description?`<div style="font-size:11.5px; color:var(--text-muted); margin-top:3px;">${escapeHtml(t.description)}</div>`:''}</div>
       <div style="display:flex; gap:6px;">
         <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); approveActivity('${t.id}')">✅</button>
         <button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); rejectActivity('${t.id}')">🚫</button>
@@ -3037,7 +3089,17 @@ function conversationsFor(u){
 }
 function lastMsg(convId_){ const ms = MESSAGES.filter(m=>m.conv===convId_); return ms[ms.length-1]; }
 let MSG_READ = {};
-function markConvoRead(userId, convId_){ MSG_READ[userId+'::'+convId_] = SIM_NOW.toISOString(); }
+/* Écrit une valeur idempotente (l'horodatage du dernier message du fil, pas "maintenant") :
+   appelée à chaque rendu de la vue Messages, elle ne doit PAS produire une valeur différente
+   tant qu'aucun nouveau message n'est arrivé, sinon MSG_READ semblerait changer à chaque rendu
+   et relancerait indéfiniment une sauvegarde (même scintillement que pour FEED_SEEN). */
+function markConvoRead(userId, convId_){
+  const key = userId+'::'+convId_;
+  const thread = MESSAGES.filter(m=>m.conv===convId_);
+  if(!thread.length) return;
+  const lastAt = thread[thread.length-1].at;
+  if(!MSG_READ[key] || MSG_READ[key] < lastAt) MSG_READ[key] = lastAt;
+}
 function unreadMessagesCount(userId){
   return conversationsFor(userByIdSafe(userId)).reduce((total,c)=>{
     const lastRead = MSG_READ[userId+'::'+c.id];
@@ -3189,7 +3251,6 @@ function confirmScheduleMeeting(){
 /* =========================== ACTIVITÉS — fil d'équipe (façon réseau social) =========================== */
 let POSTS = [];
 function viewFeed(){
-  FEED_SEEN[S.user.id] = SIM_NOW.toISOString();
   const sorted = POSTS.slice().sort((a,b)=>new Date(b.at)-new Date(a.at));
   return `
   <div class="feed-wrap">
@@ -3383,14 +3444,26 @@ document.addEventListener('click', e=>{
 
 /* =========================== RENDER DISPATCH =========================== */
 let RENDER_RETRY = false;
+let _firstContentPainted = false;
+let _prevRenderedView = null;
 function render(){
   try{
-    scheduleSave();
+    if(stateDirty()) scheduleSave();
     refreshDerivedStatuses();
     renderNav();
     document.getElementById('pageTitle').textContent = PAGE_TITLES[S.view]||'';
     document.getElementById('clockVal').textContent = nowTime()+' · '+fmtDow(todayISO()).split(' ')[0];
     const c = document.getElementById('content');
+    /* Marque le fil d'actualité comme "vu" seulement à l'ENTRÉE sur cette vue (pas à chaque
+       rendu) : FEED_SEEN[user] change de valeur à chaque appel sinon, ce qui la rendrait
+       perpétuellement "différente" de _lastSyncedSnapshot et relancerait une boucle de
+       sauvegarde/rendu tant que l'utilisateur reste sur le fil. */
+    if(S.view==='feed' && _prevRenderedView!=='feed' && S.user) FEED_SEEN[S.user.id] = SIM_NOW.toISOString();
+    _prevRenderedView = S.view;
+    /* L'animation d'apparition des cartes (cardIn) ne doit jouer qu'au tout premier affichage :
+       sur les rendus suivants (poll, navigation, etc.) elle rejouerait à chaque fois et donnerait
+       une impression de scintillement. */
+    if(_firstContentPainted) document.body.classList.add('no-card-anim'); else _firstContentPainted = true;
     const map = { dashboard:viewDashboard, myday:viewMyDay, team:viewTeam, tasks:viewTasks, projects:viewProjects, objectives:viewObjectives, performance:viewPerformance, calendar:viewCalendar, notifications:viewNotifications, reports:viewReports, settings:viewSettings, messages:viewMessages, feed:viewFeed, profile:viewProfile };
     c.innerHTML = (map[S.view]||viewDashboard)();
     if(S.view==='reports') renderReport();
