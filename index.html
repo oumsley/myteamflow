@@ -541,10 +541,11 @@
   .toast{ position:fixed; bottom:20px; right:20px; background:var(--dark); color:#fff; padding:12px 18px; border-radius:10px; font-size:13px; box-shadow:var(--shadow); z-index:80; display:flex; align-items:center; gap:8px; }
 
   @media print{
-    .sidebar, .topbar, .toast, .modal-back, #reportOut ~ *, .flex-between button, .flex-between select { display:none !important; }
+    .sidebar, .topbar, .toast, .modal-back, #reportOut ~ *, .flex-between button, .flex-between select, .bottom-nav, .fab-btn, .fab-menu { display:none !important; }
     body, .content{ background:#fff !important; margin:0; padding:0; }
     .main{ display:block !important; }
     .report-doc{ box-shadow:none; border:none; }
+    #recapPrintArea .task-actions{ display:none !important; }
   }
 </style>
 
@@ -845,6 +846,12 @@ const NOTIF_STYLE = {
 /* ---------------- Daily plan status ---------------- */
 let PLAN_STATUS = {};
 let PLAN_DAY = {};
+/* Explicite "Démarrer ma journée" : DAY_STARTED[userId] = date ISO de la journée démarrée.
+   Tant que la date du jour courant (PLAN_DAY[userId]) ne correspond pas à cette valeur, le
+   collaborateur n'a pas encore démarré sa journée et ne peut pas créer d'activité (voir
+   dayStarted() / startMyDay() / confirmAddActivity()). Réinitialisé à chaque clôture de
+   journée (confirmCloseDay) pour forcer un nouveau démarrage explicite le jour suivant. */
+let DAY_STARTED = {};
 
 /* =========================== STATE =========================== */
 const S = { user:null, view:'dashboard', projectDetail:null, calMonth:new Date().getMonth(), calYear:new Date().getFullYear(), planFilterDate: todayISO(), activeConvo:null, profileUserId:null, mobileMsgView:'list' };
@@ -880,7 +887,7 @@ const NAV = {
   ],
   collab: [
     {v:'myday', ic:'📅', label:'Ma journée'},
-    {v:'tasks', ic:'✓', label:'Mes actions'},
+    {v:'tasks', ic:'✓', label:'Mes Récaps'},
     {v:'feed', ic:'📰', label:"Fil d'actualité"},
     {v:'objectives', ic:'🎯', label:'Mes objectifs'},
     {v:'projects', ic:'🚀', label:'Projets & Campagnes'},
@@ -895,7 +902,7 @@ const PAGE_TITLES = {dashboard:'Dashboard', myday:'Ma journée', team:'Mon équi
 const BOTTOM_NAV = {
   manager: [ {v:'dashboard', ic:'🏠', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'✓', label:'Actions'}, {v:'messages', ic:'💬', label:'Messages'} ],
   admin: [ {v:'dashboard', ic:'🏠', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'team', ic:'👥', label:'Utilisateurs'}, {v:'messages', ic:'💬', label:'Messages'} ],
-  collab: [ {v:'myday', ic:'📅', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'✓', label:'Actions'}, {v:'messages', ic:'💬', label:'Messages'} ],
+  collab: [ {v:'myday', ic:'📅', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'✓', label:'Récaps'}, {v:'messages', ic:'💬', label:'Messages'} ],
 };
 
 /* =========================== helpers UI =========================== */
@@ -978,7 +985,7 @@ function _stableJSON(v){ try{ return JSON.stringify(v); }catch(e){ return String
 function collectState(){
   return {
     USERS, DEPARTMENTS, PROJECTS, TASKS, OBJECTIVES, WEIGHTS, NOTIFICATIONS,
-    PLAN_STATUS, PLAN_DAY, MESSAGES, MSG_READ, FEED_SEEN, MEETINGS, POSTS, DAY_REPORTS,
+    PLAN_STATUS, PLAN_DAY, MESSAGES, MSG_READ, FEED_SEEN, MEETINGS, POSTS, DAY_REPORTS, DAY_STARTED,
   };
 }
 function applyState(data){
@@ -999,6 +1006,7 @@ function applyState(data){
   if(Array.isArray(data.MEETINGS)) MEETINGS = data.MEETINGS;
   if(Array.isArray(data.POSTS)) POSTS = data.POSTS;
   if(Array.isArray(data.DAY_REPORTS)) setArr(DAY_REPORTS, data.DAY_REPORTS);
+  if(data.DAY_STARTED) DAY_STARTED = data.DAY_STARTED;
 }
 /* Fusionne deux tableaux d'objets {id,...} : on garde toute entrée distante absente en local
    (insérée par un autre navigateur pendant que le nôtre était hors ligne / avait un modal ouvert),
@@ -1063,7 +1071,7 @@ async function fetchRemoteState(){
   return null;
 }
 const SYNC_ARRAY_KEYS = ['USERS','DEPARTMENTS','PROJECTS','TASKS','OBJECTIVES','NOTIFICATIONS','MESSAGES','MEETINGS','POSTS','DAY_REPORTS'];
-const SYNC_OBJECT_KEYS = ['WEIGHTS','PLAN_STATUS','PLAN_DAY','MSG_READ','FEED_SEEN'];
+const SYNC_OBJECT_KEYS = ['WEIGHTS','PLAN_STATUS','PLAN_DAY','MSG_READ','FEED_SEEN','DAY_STARTED'];
 /* Vrai si l'état local a divergé de la dernière copie qu'on sait synchronisée avec le serveur.
    Sert de garde à render() pour ne programmer une sauvegarde QUE quand quelque chose a
    réellement changé -- sans ça, render() appelait scheduleSave() à chaque rendu, y compris ceux
@@ -1294,7 +1302,7 @@ function renderNav(){
   else { document.getElementById('whoAvatar').style.background = avatarColor(S.user.id); document.getElementById('whoAvatar').textContent = initials(S.user.name); }
   document.getElementById('whoName').textContent = S.user.nickname ? `${S.user.name} · ${S.user.nickname}` : S.user.name;
   document.getElementById('whoRole').textContent = roleLabel[S.user.role];
-  document.getElementById('pageTitle').textContent = PAGE_TITLES[S.view] || '';
+  document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user && S.user.role==='collab') ? 'Mes Récaps' : (PAGE_TITLES[S.view] || '');
   const dept = currentDept();
   const brandMarkEl = document.getElementById('brandMark');
   if(dept){
@@ -1619,9 +1627,41 @@ function approvePlan(uid){
   toast(userByIdSafe(uid).name+' : plan validé — la journée peut démarrer.'); render();
 }
 
+/* Vrai si CE collaborateur a déjà cliqué "Démarrer ma journée" pour la journée en cours
+   (PLAN_DAY[u.id]). Tant que ce n'est pas le cas, il ne doit avoir accès à aucune création
+   d'activité — voir startMyDay() et le garde-fou dans confirmAddActivity(). */
+function dayStarted(u){ return DAY_STARTED[u.id] === (PLAN_DAY[u.id] || todayISO()); }
+function canStartDayNow(){ return nowTime() >= WORK_START; }
+function startMyDay(){
+  if(!canStartDayNow()){ toast(`Ta journée démarre à ${WORK_START}.`); return; }
+  const day = PLAN_DAY[S.user.id] || todayISO();
+  PLAN_DAY[S.user.id] = day;
+  if(!PLAN_STATUS[S.user.id]) PLAN_STATUS[S.user.id] = 'brouillon';
+  DAY_STARTED[S.user.id] = day;
+  render(); toast('Journée démarrée — tu peux maintenant ajouter tes activités.');
+}
 function renderOwnDay(u, full){
   const status = PLAN_STATUS[u.id];
   const day = PLAN_DAY[u.id] || todayISO();
+
+  /* --- Étape 0 : JOURNÉE PAS ENCORE DÉMARRÉE — gate explicite sur la création d'activités --- */
+  if(u.role==='collab' && !dayStarted(u) && status!=='soumis' && status!=='validé'){
+    const readyNow = canStartDayNow();
+    return `
+    <div class="card" style="text-align:center; padding:10px 0;">
+      <div class="card-body">
+        <div style="font-size:38px; margin-bottom:8px;">🚀</div>
+        <h2 style="margin:0 0 6px;">Bonjour ${u.name.split(' ')[0]} 👋</h2>
+        <p style="color:var(--text-muted); font-size:13.5px; max-width:440px; margin:0 auto 20px;">
+          ${readyNow
+            ? `Ta journée de travail (${WORK_START}–${WORK_END}) peut commencer. Démarre-la pour pouvoir ajouter tes activités du ${fmtDate(day)} — la création d'activités n'est pas possible avant.`
+            : `Ta journée de travail démarre à ${WORK_START}. Tu ne peux pas encore ajouter d'activité — reviens à cette heure pour démarrer ta journée.`}
+        </p>
+        <button class="btn btn-primary" style="min-width:230px; min-height:46px; font-size:14px;" ${readyNow?'':'disabled'} onclick="startMyDay()">▶ Démarrer ma journée</button>
+        ${readyNow? '' : `<div style="margin-top:12px; font-size:11.5px; color:var(--text-faint);">Disponible à partir de ${WORK_START} (il est ${nowTime()})</div>`}
+      </div>
+    </div>`;
+  }
 
   /* --- Étape 1 : BROUILLON — construire le plan avant de le soumettre --- */
   if(u.role==='collab' && status==='brouillon'){
@@ -1710,9 +1750,22 @@ function renderOwnDay(u, full){
     </div>
     <div class="card-body">
       <div class="bar-track" style="margin-bottom:16px;"><div class="bar-fill" style="width:${pct}%"></div></div>
-      ${todays.length? todays.map(t=>renderTaskCard(t)).join('') : `<div class="empty">Aucune activité pour aujourd'hui.</div>`}
+      ${(()=>{
+        /* Lecture claire : deux groupes visuellement distincts plutôt qu'une liste unique, pour
+           qu'un collaborateur voie d'un coup d'œil ce qu'il lui reste à faire (en cours / à
+           faire / bloqué / en pause) séparément de ce qui est déjà bouclé. */
+        const activeList = todays.filter(t=>t.status!=='Terminée');
+        const doneList = todays.filter(t=>t.status==='Terminée');
+        if(!todays.length) return `<div class="empty">Aucune activité pour aujourd'hui.</div>`;
+        return `
+          ${activeList.length?`<div style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--text-muted); margin:0 0 8px;">🕓 En cours / à faire (${activeList.length})</div>${activeList.map(t=>renderTaskCard(t)).join('')}`:''}
+          ${doneList.length?`<div style="font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--success-dark); margin:${activeList.length?'18px':'0'} 0 8px;">✅ Terminées (${doneList.length})</div>${doneList.map(t=>renderTaskCard(t)).join('')}`:''}
+          ${!activeList.length && !doneList.length?`<div class="empty">Aucune activité pour aujourd'hui.</div>`:''}
+        `;
+      })()}
       ${(S.user.role==='collab')?`
-      <div class="task-actions" style="margin-top:14px; align-items:center;">
+      <div class="task-actions" style="margin-top:14px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-outline btn-sm" onclick="openAddActivity()">+ Ajouter une activité</button>
         <button class="btn btn-ghost btn-sm" ${canCloseDayNow()?'':'disabled'} onclick="openCloseDay()">🌙 Clôturer ma journée</button>
         ${canCloseDayNow()?'':`<span style="font-size:11.5px; color:var(--text-faint);">Disponible à partir de ${CLOSE_DAY_TIME} (il est ${nowTime()})</span>`}
       </div>`:''}
@@ -1764,7 +1817,14 @@ function renderTaskCard(t){
   const canAct = (S.user.id===t.assignee) || S.user.role==='manager' || S.user.role==='admin';
   let actions = '';
   if(S.user.id===t.assignee){
-    if(t.status==='À faire' || t.status==='En retard') actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Démarrer</button>`;
+    if(t.status==='À faire' || t.status==='En retard'){
+      /* Gate d'approbation : une activité auto-déclarée encore "en attente" ne peut pas être
+         démarrée tant que le responsable ne l'a pas validée (voir approveActivity()). On
+         remplace le bouton Démarrer par un indicateur clair plutôt que de le désactiver
+         silencieusement, pour que l'attente soit explicite. */
+      if(t.approval==='pending') actions += `<span class="pill pill-warn" style="padding:7px 12px; font-size:11.5px;">⏳ En attente de validation du responsable</span>`;
+      else actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Démarrer</button>`;
+    }
     if(t.status==='En cours'){
       actions += `<button class="btn btn-outline btn-sm" onclick="openPause('${t.id}')">⏸ Pause</button>`;
       actions += `<button class="btn btn-outline btn-sm" onclick="openBlock('${t.id}')">⛔ Bloquer</button>`;
@@ -1804,7 +1864,12 @@ function renderTaskCard(t){
 }
 
 function setTaskStatus(id, status){
-  const t = TASKS.find(x=>x.id===id); t.status=status; render(); toast('Statut mis à jour : '+status);
+  const t = TASKS.find(x=>x.id===id);
+  /* Garde-fou serveur en plus du masquage du bouton : une activité "en attente de validation"
+     ne peut jamais passer "En cours", même via un appel direct (double-clic, focus resté sur
+     un ancien bouton, etc.). */
+  if(status==='En cours' && t.approval==='pending'){ toast('Cette activité doit d\'abord être validée par votre responsable.'); render(); return; }
+  t.status=status; render(); toast('Statut mis à jour : '+status);
 }
 function openPause(id){
   openModal(`<div class="modal-head"><h3>Mettre en pause</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
@@ -1839,6 +1904,7 @@ function confirmFinish(id){
   closeModal(); render(); toast('Tâche terminée ✔');
 }
 function openAddActivity(){
+  if(S.user.role==='collab' && !dayStarted(S.user)){ toast('Démarre ta journée avant d\'ajouter une activité.'); return; }
   openModal(`<div class="modal-head"><h3>Ajouter une activité</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="field"><label>Titre</label><input id="naTitle" placeholder="ex. Préparer le calendrier TikTok septembre"/></div>
@@ -1857,6 +1923,10 @@ function openAddActivity(){
   <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Annuler</button><button class="btn btn-primary" onclick="confirmAddActivity()">Ajouter au plan</button></div>`);
 }
 function confirmAddActivity(){
+  /* Garde-fou serveur (en plus du masquage du bouton dans l'UI) : un collaborateur qui n'a pas
+     cliqué "Démarrer ma journée" ne peut créer aucune activité, quel que soit le point d'entrée
+     utilisé (bouton, FAB "Nouvelle action", etc.). */
+  if(S.user.role==='collab' && !dayStarted(S.user)){ closeModal(); toast('Démarre ta journée avant d\'ajouter une activité.'); return; }
   const title = document.getElementById('naTitle').value.trim();
   if(!title){ toast('Merci de renseigner un titre.'); return; }
   const projId = document.getElementById('naProj').value;
@@ -1963,6 +2033,7 @@ function confirmCloseDay(){
   });
   PLAN_STATUS[S.user.id] = 'brouillon';
   PLAN_DAY[S.user.id] = nxt;
+  delete DAY_STARTED[S.user.id]; /* la journée suivante doit être démarrée explicitement à nouveau */
   openDayReportModal(day, unfinished.length);
 }
 
@@ -2115,6 +2186,74 @@ function dynamicBadges(userId){
 }
 
 /* =========================== TASKS (Mes activités) =========================== */
+/* =========================== MES RÉCAPS (historique filtrable + rapport imprimable) ===========================
+   Remplace, pour le collaborateur, l'ancienne vue "Mes actions" (liste plate par statut) par un
+   véritable historique de ses activités, filtrable jour / semaine / mois, avec un bouton
+   d'impression/export PDF natif (window.print() + feuille de style @media print déjà en place
+   pour les Rapports, étendue ici à #recapPrintArea). Les responsables/admin conservent l'ancienne
+   vue "Toutes les actions" (viewTasks) inchangée — voir viewTasksOrRecap(). */
+function periodBounds(period){
+  const today = todayISO();
+  if(period==='week'){
+    const d = new Date(today+'T00:00:00'); const dow=(d.getDay()+6)%7;
+    const monday = addDays(today,-dow); const sunday = addDays(monday,6);
+    return {from:monday, to:sunday, label:weekRangeLabel(today)};
+  }
+  if(period==='month'){
+    const d = new Date(today+'T00:00:00');
+    const first = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`;
+    const lastDay = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate();
+    const last = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(lastDay).padStart(2,'0')}`;
+    return {from:first, to:last, label:d.toLocaleDateString('fr-FR',{month:'long', year:'numeric'})};
+  }
+  return {from:today, to:today, label:fmtDate(today)};
+}
+function viewTasksOrRecap(){ return (S.user && S.user.role==='collab') ? viewMyRecap() : viewTasks(); }
+function viewMyRecap(){
+  const period = S.recapPeriod = S.recapPeriod || 'day';
+  const {from,to,label} = periodBounds(period);
+  const mine = TASKS.filter(t=>t.assignee===S.user.id && t.date>=from && t.date<=to);
+  const done = mine.filter(t=>t.status==='Terminée');
+  const pending = mine.filter(t=>t.status!=='Terminée');
+  const late = mine.filter(t=>t.status==='En retard').length;
+  const pct = mine.length? Math.round(done.length/mine.length*100):0;
+  const reports = DAY_REPORTS.filter(r=>r.user===S.user.id && r.day>=from && r.day<=to).sort((a,b)=>new Date(b.at)-new Date(a.at));
+  const apps = appreciationsFor(S.user.id).filter(a=>a.task.date>=from && a.task.date<=to);
+  const periodBtn = (key,lbl)=>`<button class="btn ${period===key?'btn-primary':'btn-outline'} btn-sm" onclick="S.recapPeriod='${key}'; render();">${lbl}</button>`;
+  return `
+    <div class="flex-between" style="margin-bottom:16px; flex-wrap:wrap; gap:10px;">
+      <div><div class="section-title">Mes Récaps</div><p class="section-sub">Historique de mes activités — ${label}</p></div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        ${periodBtn('day','Jour')}${periodBtn('week','Semaine')}${periodBtn('month','Mois')}
+        <button class="btn btn-ghost btn-sm" onclick="window.print()">⬇ Imprimer / PDF</button>
+      </div>
+    </div>
+    <div id="recapPrintArea">
+      <div class="report-stat-row" style="margin-bottom:18px;">
+        <div class="report-stat"><b>${mine.length}</b><span>action(s)</span></div>
+        <div class="report-stat"><b>${done.length}</b><span>terminée(s)</span></div>
+        <div class="report-stat" style="${late?'color:var(--crit);':''}"><b>${late}</b><span>en retard</span></div>
+        <div class="report-stat"><b>${pct}%</b><span>taux de réalisation</span></div>
+      </div>
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><h3>✅ Terminées</h3><span class="sub">${done.length}</span></div>
+        <div class="card-body">${done.length? done.map(t=>renderTaskCard(t)).join('') : `<div class="empty">Aucune action terminée sur cette période.</div>`}</div>
+      </div>
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><h3>🕓 En cours / à faire</h3><span class="sub">${pending.length}</span></div>
+        <div class="card-body">${pending.length? pending.map(t=>renderTaskCard(t)).join('') : `<div class="empty">Rien en attente sur cette période.</div>`}</div>
+      </div>
+      ${reports.length?`<div class="card" style="margin-bottom:16px;">
+        <div class="card-head"><h3>🌙 Bilans de journée</h3><span class="sub">${reports.length}</span></div>
+        <div class="card-body">${reports.map(r=>`<div style="padding:8px 0; border-bottom:1px solid var(--border); font-size:12.5px;"><b>${DAY_EFFICIENCY[r.efficiency].emoji} ${DAY_EFFICIENCY[r.efficiency].label}</b> — ${fmtDate(r.day)}${r.comment?` <span style="color:var(--text-muted);">« ${r.comment} »</span>`:''}</div>`).join('')}</div>
+      </div>`:''}
+      ${apps.length?`<div class="card">
+        <div class="card-head"><h3>🏆 Appréciations</h3><span class="sub">${apps.length}</span></div>
+        <div class="card-body">${apps.map(a=>{const st=APPRECIATION_STYLE[a.type]; return `<div style="padding:8px 0; border-bottom:1px solid var(--border); font-size:12.5px;">${st.ic} <b>${st.label}</b> — ${a.task.title}${a.comment?` <span style="color:var(--text-muted);">« ${a.comment} »</span>`:''}</div>`;}).join('')}</div>
+      </div>`:''}
+    </div>
+  `;
+}
 function viewTasks(){
   refreshDerivedStatuses();
   const mine = S.user.role==='collab' ? TASKS.filter(t=>t.assignee===S.user.id) : TASKS;
@@ -2886,6 +3025,25 @@ function viewPerformance(){
     const circumference = 2*Math.PI*54;
     const badges = dynamicBadges(u.id);
     const apps = appreciationsFor(u.id);
+    /* --- Ventilations demandées : par projet, par catégorie d'activité, par objectif, et par
+       auto-évaluation quotidienne (DAY_REPORTS) --- */
+    const myTasks = TASKS.filter(t=>t.assignee===u.id);
+    const byProject = {};
+    myTasks.forEach(t=>{ const key=t.project||'_none'; (byProject[key]=byProject[key]||[]).push(t); });
+    const projectRows = Object.entries(byProject).map(([pid,list])=>{
+      const proj = pid==='_none'?null:PROJECTS.find(pp=>pp.id===pid);
+      const doneN = list.filter(t=>t.status==='Terminée').length;
+      return {name:proj?proj.name:'Sans projet', total:list.length, done:doneN, pct:list.length?Math.round(doneN/list.length*100):0};
+    }).sort((a,b)=>b.total-a.total);
+    const byCat = {};
+    myTasks.forEach(t=>{ (byCat[t.category]=byCat[t.category]||[]).push(t); });
+    const catRows = Object.entries(byCat).map(([cat,list])=>{
+      const doneN=list.filter(t=>t.status==='Terminée').length;
+      return {cat, total:list.length, done:doneN, pct:list.length?Math.round(doneN/list.length*100):0};
+    }).sort((a,b)=>b.total-a.total);
+    const myObjs = OBJECTIVES.filter(o=>o.owner===u.id);
+    const myReports = DAY_REPORTS.filter(r=>r.user===u.id);
+    const effCounts = {}; myReports.forEach(r=>{ effCounts[r.efficiency]=(effCounts[r.efficiency]||0)+1; });
     return `
     <div class="card" style="margin-bottom:18px; background:linear-gradient(120deg, var(--dark), var(--dark-2)); border:none; overflow:hidden; position:relative;">
       <div class="card-body" style="display:flex; align-items:center; gap:28px; flex-wrap:wrap;">
@@ -2917,6 +3075,40 @@ function viewPerformance(){
         </div>
       </div>
     </div>
+    <div class="grid-2" style="margin-top:16px;">
+      <div class="card">
+        <div class="card-head"><h3>Performance par projet</h3><span class="sub">${projectRows.length} projet(s)</span></div>
+        <div class="card-body">
+          ${projectRows.length? projectRows.map(r=>`<div style="margin-bottom:12px;"><div class="flex-between" style="font-size:12.5px; margin-bottom:4px;"><span>${r.name}</span><span class="mono">${r.done}/${r.total} · ${r.pct}%</span></div><div class="bar-track"><div class="bar-fill ${r.pct<50?'crit':r.pct<75?'warn':''}" style="width:${r.pct}%"></div></div></div>`).join('') : `<div class="empty">Aucune activité liée à un projet.</div>`}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Performance par catégorie d'activité</h3><span class="sub">${catRows.length} catégorie(s)</span></div>
+        <div class="card-body">
+          ${catRows.length? catRows.map(r=>`<div style="margin-bottom:12px;"><div class="flex-between" style="font-size:12.5px; margin-bottom:4px;"><span>${r.cat}</span><span class="mono">${r.done}/${r.total} · ${r.pct}%</span></div><div class="bar-track"><div class="bar-fill ${r.pct<50?'crit':r.pct<75?'warn':''}" style="width:${r.pct}%"></div></div></div>`).join('') : `<div class="empty">Aucune activité.</div>`}
+        </div>
+      </div>
+    </div>
+    <div class="grid-2" style="margin-top:16px;">
+      <div class="card">
+        <div class="card-head"><h3>Performance par objectif</h3><span class="sub">${myObjs.length} objectif(s)</span></div>
+        <div class="card-body">
+          ${myObjs.length? myObjs.map(o=>{
+            const pctO = o.type==='quantitatif' ? Math.min(100,Math.round((o.current/o.target)*100)) : (o.evaluation==='En bonne voie'||o.evaluation==='Satisfaisant'?85:60);
+            return `<div style="margin-bottom:12px;"><div class="flex-between" style="font-size:12.5px; margin-bottom:4px;"><span>${o.title}</span><span class="mono">${pctO}%</span></div><div class="bar-track"><div class="bar-fill ${pctO<50?'crit':pctO<75?'warn':''}" style="width:${pctO}%"></div></div></div>`;
+          }).join('') : `<div class="empty">Aucun objectif assigné.</div>`}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Auto-évaluations quotidiennes</h3><span class="sub">${myReports.length} bilan(s)</span></div>
+        <div class="card-body">
+          ${myReports.length? Object.entries(DAY_EFFICIENCY).map(([key,v])=>{
+            const n = effCounts[key]||0; const pctE = myReports.length? Math.round(n/myReports.length*100):0;
+            return `<div style="margin-bottom:10px;"><div class="flex-between" style="font-size:12.5px; margin-bottom:4px;"><span>${v.emoji} ${v.label}</span><span class="mono">${n} (${pctE}%)</span></div><div class="bar-track"><div class="bar-fill" style="width:${pctE}%"></div></div></div>`;
+          }).join('') : `<div class="empty">Aucun bilan de journée pour l'instant — clôture ta journée pour en générer un.</div>`}
+        </div>
+      </div>
+    </div>
     <div class="card" style="margin-top:16px;">
       <div class="card-head"><h3>Appréciations de mon responsable</h3><span class="sub">${apps.length} retour(s)</span></div>
       <div class="card-body">
@@ -2934,9 +3126,21 @@ function viewPerformance(){
   }
   const rows = USERS.filter(u=>u.role!=='admin').map(u=>({u,p:computePerformance(u.id)})).sort((a,b)=>b.p.score-a.p.score);
   const medals=['🥇','🥈','🥉'];
+  const teamGlobal = rows.length? Math.round(rows.reduce((s,r)=>s+r.p.score,0)/rows.length) : 0;
+  const projTerm = PROJECTS.filter(pp=>projectProgress(pp.id)===100).length;
+  const objAtteints = OBJECTIVES.filter(o=> o.type==='quantitatif' ? (o.current/o.target)>=0.9 : o.evaluation!=='Insuffisant').length;
+  const teamReports = DAY_REPORTS.filter(r=>rows.some(x=>x.u.id===r.user));
+  const teamEffCounts = {}; teamReports.forEach(r=>{ teamEffCounts[r.efficiency]=(teamEffCounts[r.efficiency]||0)+1; });
+  const bestEff = Object.entries(teamEffCounts).sort((a,b)=>b[1]-a[1])[0];
   return `
   <div class="section-title">Performance de l'équipe</div>
   <p class="section-sub">Score = ${WEIGHTS.realisation}% réalisation + ${WEIGHTS.delais}% délais + ${WEIGHTS.qualite}% qualité + ${WEIGHTS.objectifs}% objectifs + ${WEIGHTS.initiative}% initiative/collaboration</p>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="lbl">🌍 Score global équipe</div><div class="val">${teamGlobal}%</div></div>
+    <div class="kpi"><div class="lbl">🚀 Projets terminés</div><div class="val">${projTerm}/${Math.max(0,PROJECTS.length-1)}</div></div>
+    <div class="kpi"><div class="lbl">🎯 Objectifs atteints</div><div class="val">${objAtteints}/${OBJECTIVES.length}</div></div>
+    <div class="kpi"><div class="lbl">🌙 Auto-évaluation dominante</div><div class="val" style="font-size:16px;">${bestEff? `${DAY_EFFICIENCY[bestEff[0]].emoji} ${DAY_EFFICIENCY[bestEff[0]].label}` : '—'}</div></div>
+  </div>
   <div class="card" style="margin-bottom:18px;">
     <div class="table-wrap"><table>
       <thead><tr><th></th><th>Collaborateur</th><th>Tâches</th><th>Réalisées</th><th>Retard</th><th>Qualité</th><th>Objectifs</th><th>Badges</th><th>Performance</th></tr></thead>
@@ -3530,7 +3734,7 @@ function render(){
     if(stateDirty()) scheduleSave();
     refreshDerivedStatuses();
     renderNav();
-    document.getElementById('pageTitle').textContent = PAGE_TITLES[S.view]||'';
+    document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user && S.user.role==='collab') ? 'Mes Récaps' : (PAGE_TITLES[S.view]||'');
     document.getElementById('clockVal').textContent = nowTime()+' · '+fmtDow(todayISO()).split(' ')[0];
     const c = document.getElementById('content');
     /* Marque le fil d'actualité comme "vu" seulement à l'ENTRÉE sur cette vue (pas à chaque
@@ -3543,7 +3747,7 @@ function render(){
        sur les rendus suivants (poll, navigation, etc.) elle rejouerait à chaque fois et donnerait
        une impression de scintillement. */
     if(_firstContentPainted) document.body.classList.add('no-card-anim'); else _firstContentPainted = true;
-    const map = { dashboard:viewDashboard, myday:viewMyDay, team:viewTeam, tasks:viewTasks, projects:viewProjects, objectives:viewObjectives, performance:viewPerformance, calendar:viewCalendar, notifications:viewNotifications, reports:viewReports, settings:viewSettings, messages:viewMessages, feed:viewFeed, profile:viewProfile };
+    const map = { dashboard:viewDashboard, myday:viewMyDay, team:viewTeam, tasks:viewTasksOrRecap, projects:viewProjects, objectives:viewObjectives, performance:viewPerformance, calendar:viewCalendar, notifications:viewNotifications, reports:viewReports, settings:viewSettings, messages:viewMessages, feed:viewFeed, profile:viewProfile };
     c.innerHTML = (map[S.view]||viewDashboard)();
     if(S.view==='reports') renderReport();
     if(S.view==='messages') afterRenderMessages();
