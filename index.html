@@ -838,6 +838,7 @@ const NOTIF_STYLE = {
   tache:{ic:'🔵', bg:'var(--info-bg)', color:'var(--info)'},
   projet:{ic:'🟣', bg:'var(--accent-light)', color:'var(--accent)'},
   blocage:{ic:'⚠️', bg:'var(--crit-bg)', color:'var(--crit)'},
+  a_valider:{ic:'📝', bg:'var(--warn-bg)', color:'var(--warn)'},
 };
 
 /* ---------------- Daily plan status ---------------- */
@@ -905,7 +906,7 @@ function managerIds(){ return USERS.filter(u=>u.role==='manager').map(u=>u.id); 
 function notifyManagers(payload){
   const deptId = S.user && S.user.departmentId;
   const targets = deptId ? USERS.filter(u=>u.role==='manager' && u.departmentId===deptId).map(u=>u.id) : managerIds();
-  targets.forEach(mid=>NOTIFICATIONS.unshift({id:uid('n'), to:mid, at:SIM_NOW.toISOString(), read:false, ...payload}));
+  targets.forEach(mid=>NOTIFICATIONS.unshift({id:uid('n'), to:mid, from:S.user.id, at:SIM_NOW.toISOString(), read:false, ...payload}));
 }
 function toast(msg){
   const t = el(`<div class="toast">✓ ${msg}</div>`);
@@ -966,11 +967,16 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 let _remoteUpdatedAt = null;
 let _saveTimer = null;
 let _syncing = false;
+/* Dernier état qu'on SAIT synchronisé avec le serveur (juste après un chargement ou une
+   sauvegarde réussie). Sert de référence pour distinguer "j'ai modifié ce champ" de
+   "je n'ai fait que recopier une ancienne valeur" -- voir mergeArraysById / mergeKeyedObject. */
+let _lastSyncedSnapshot = null;
+function _stableJSON(v){ try{ return JSON.stringify(v); }catch(e){ return String(v); } }
 
 function collectState(){
   return {
     USERS, DEPARTMENTS, PROJECTS, TASKS, OBJECTIVES, WEIGHTS, NOTIFICATIONS,
-    PLAN_STATUS, PLAN_DAY, MESSAGES, MSG_READ, FEED_SEEN, MEETINGS, POSTS,
+    PLAN_STATUS, PLAN_DAY, MESSAGES, MSG_READ, FEED_SEEN, MEETINGS, POSTS, DAY_REPORTS,
   };
 }
 function applyState(data){
@@ -990,56 +996,164 @@ function applyState(data){
   if(data.FEED_SEEN) FEED_SEEN = data.FEED_SEEN;
   if(Array.isArray(data.MEETINGS)) MEETINGS = data.MEETINGS;
   if(Array.isArray(data.POSTS)) POSTS = data.POSTS;
+  if(Array.isArray(data.DAY_REPORTS)) setArr(DAY_REPORTS, data.DAY_REPORTS);
 }
-async function saveStateRemote(){
-  try{
-    _syncing = true;
-    const now = new Date().toISOString();
-    await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.main`, {
-      method:'PATCH',
-      headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':'application/json', 'Prefer':'return=minimal' },
-      body: JSON.stringify({ data: collectState(), updated_at: now }),
-    });
-    _remoteUpdatedAt = now;
-  }catch(e){ console.warn('TeamFlow sync (save) impossible :', e); }
-  finally{ _syncing = false; }
+/* Fusionne deux tableaux d'objets {id,...} : on garde toute entrée distante absente en local
+   (insérée par un autre navigateur pendant que le nôtre était hors ligne / avait un modal ouvert),
+   et pour un id présent des deux côtés on ne privilégie PAS bêtement "local" : on compare la copie
+   locale à la dernière copie qu'on sait synchronisée (lastArr). Si elle est identique, ce navigateur
+   n'a pas touché cette entrée depuis sa dernière synchro -- on garde alors la version distante (qui
+   peut avoir été modifiée par quelqu'un d'autre pendant ce temps). Si elle diffère, c'est CE
+   navigateur qui l'a modifiée -- on garde la version locale. Ça évite qu'un simple spectateur qui
+   sauvegarde pour une tout autre raison n'écrase silencieusement la modification de quelqu'un d'autre
+   sur un enregistrement qu'il n'a lui-même jamais touché (ex. un collaborateur qui ajoute une tâche
+   pendant que son responsable renomme un projet). */
+function mergeArraysById(localArr, remoteArr, lastArr){
+  const remoteMap = new Map();
+  (Array.isArray(remoteArr)?remoteArr:[]).forEach(item=>{ if(item && item.id!=null) remoteMap.set(item.id, item); });
+  const lastMap = new Map();
+  (Array.isArray(lastArr)?lastArr:[]).forEach(item=>{ if(item && item.id!=null) lastMap.set(item.id, item); });
+  const merged = new Map(remoteMap);
+  (Array.isArray(localArr)?localArr:[]).forEach(item=>{
+    if(!item || item.id==null) return;
+    if(remoteMap.has(item.id)){
+      const lastItem = lastMap.get(item.id);
+      const unchangedLocally = lastMap.has(item.id) && _stableJSON(lastItem)===_stableJSON(item);
+      merged.set(item.id, unchangedLocally ? remoteMap.get(item.id) : item);
+    } else {
+      merged.set(item.id, item); // nouvel ajout local, pas encore vu du côté distant
+    }
+  });
+  return Array.from(merged.values());
 }
-function scheduleSave(){
-  if(_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(saveStateRemote, 700);
+/* Même logique que mergeArraysById mais pour les objets "dictionnaire" indexés par clé (id
+   utilisateur, etc.) comme PLAN_STATUS, MSG_READ, FEED_SEEN, ou l'objet WEIGHTS lui-même (dont les
+   "clés" sont les catégories de pondération). */
+function mergeKeyedObject(localObj, remoteObj, lastObj){
+  localObj = localObj||{}; remoteObj = remoteObj||{}; lastObj = lastObj||{};
+  const merged = Object.assign({}, remoteObj);
+  Object.keys(localObj).forEach(k=>{
+    const wasKnown = Object.prototype.hasOwnProperty.call(lastObj, k);
+    const unchangedLocally = wasKnown && _stableJSON(lastObj[k])===_stableJSON(localObj[k]);
+    if(unchangedLocally){
+      if(!Object.prototype.hasOwnProperty.call(remoteObj, k)) merged[k] = localObj[k];
+      // sinon on garde déjà la valeur distante (potentiellement plus récente) copiée ci-dessus
+    } else {
+      merged[k] = localObj[k]; // modifié localement (ou nouveau) : on le garde
+    }
+  });
+  return merged;
 }
-async function loadStateRemote(){
+/* Conservé pour compatibilité ; utilisé uniquement quand on n'a aucun instantané de référence. */
+function mergePlainObjects(localObj, remoteObj){
+  return Object.assign({}, remoteObj||{}, localObj||{});
+}
+async function fetchRemoteState(){
   try{
     const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.main&select=data,updated_at`, {
       headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY },
     });
     const rows = await res.json();
     if(rows && rows[0] && rows[0].data && Object.keys(rows[0].data).length){
-      applyState(rows[0].data);
-      _remoteUpdatedAt = rows[0].updated_at;
+      return {data: rows[0].data, updated_at: rows[0].updated_at};
+    }
+  }catch(e){ console.warn('TeamFlow sync (lecture) impossible :', e); }
+  return null;
+}
+const SYNC_ARRAY_KEYS = ['USERS','DEPARTMENTS','PROJECTS','TASKS','OBJECTIVES','NOTIFICATIONS','MESSAGES','MEETINGS','POSTS','DAY_REPORTS'];
+const SYNC_OBJECT_KEYS = ['WEIGHTS','PLAN_STATUS','PLAN_DAY','MSG_READ','FEED_SEEN'];
+/* Remplace le simple "écraser tout le blob distant" (saveStateRemote) par une vraie fusion :
+   on relit l'état distant courant, on fusionne chaque tableau par id (au lieu d'un last-write-wins
+   sur l'ensemble du blob) puis on ré-applique le résultat fusionné en local ET on le sauvegarde.
+   Ainsi les actions créées par un collègue pendant que ce navigateur était hors-ligne (modal ouvert,
+   focus clavier, etc.) ne sont jamais silencieusement effacées par notre propre sauvegarde. */
+/* Écrit le blob fusionné avec un verrou optimiste (compare-and-swap sur updated_at) :
+   le PATCH ne s'applique QUE si la ligne distante a toujours le updated_at qu'on vient de lire.
+   Si un autre navigateur a écrit entre notre lecture et notre écriture, 0 ligne est modifiée
+   -- on relit alors l'état (désormais plus récent) et on refusionne, au lieu d'écraser
+   aveuglément une modification concurrente sur le même enregistrement (ex. deux personnes qui
+   renomment le même projet en même temps). */
+async function mergeAndSave(attempt){
+  attempt = attempt||0;
+  try{
+    _syncing = true;
+    const local = collectState();
+    const remoteState = await fetchRemoteState();
+    const merged = {};
+    if(remoteState && remoteState.data){
+      const last = _lastSyncedSnapshot;
+      SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = mergeArraysById(local[k], remoteState.data[k], last && last[k]); });
+      SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = mergeKeyedObject(local[k], remoteState.data[k], last && last[k]); });
+    } else {
+      /* Pas d'état distant exploitable : on copie (au lieu de réutiliser la même référence)
+         pour qu'applyState() -- qui mute les tableaux "in place" -- ne vide pas nos propres
+         tableaux globaux avant de les avoir sauvegardés. */
+      SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = Array.isArray(local[k]) ? local[k].slice() : local[k]; });
+      SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = Object.assign({}, local[k]); });
+    }
+    applyState(merged);
+    const now = new Date().toISOString();
+    const casFilter = (remoteState && remoteState.updated_at) ? `id=eq.main&updated_at=eq.${encodeURIComponent(remoteState.updated_at)}` : `id=eq.main`;
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?${casFilter}&select=updated_at`, {
+      method:'PATCH',
+      headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':'application/json', 'Prefer':'return=representation' },
+      body: JSON.stringify({ data: merged, updated_at: now }),
+    });
+    let rows = [];
+    try{ rows = await res.json(); }catch(e){}
+    if(Array.isArray(rows) && rows.length===0 && attempt<5){
+      _syncing = false;
+      return mergeAndSave(attempt+1); // quelqu'un d'autre a écrit entretemps : on relit et refusionne
+    }
+    _remoteUpdatedAt = now;
+    /* Clone profond indispensable : applyState() ci-dessus a fait pointer TASKS/NOTIFICATIONS/...
+       directement vers les objets de "merged". Si on gardait _lastSyncedSnapshot = merged tel quel,
+       une mutation locale ultérieure (ex. approveActivity qui fait t.approval='approved') modifierait
+       aussi silencieusement l'instantané de référence -- rendant local et "dernier synchronisé"
+       perpétuellement identiques et empêchant toute détection de modification locale. */
+    _lastSyncedSnapshot = JSON.parse(JSON.stringify(merged));
+    if(S.user) render();
+  }catch(e){ console.warn('TeamFlow sync (save) impossible :', e); }
+  finally{ _syncing = false; }
+}
+/* Conservé pour compatibilité : ancien nom, redirige vers la version fusionnée. */
+async function saveStateRemote(){ return mergeAndSave(); }
+function scheduleSave(){
+  if(_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(mergeAndSave, 700);
+}
+async function loadStateRemote(){
+  const remoteState = await fetchRemoteState();
+  if(remoteState){
+    applyState(remoteState.data);
+    _remoteUpdatedAt = remoteState.updated_at;
+    _lastSyncedSnapshot = JSON.parse(JSON.stringify(remoteState.data)); // clone : voir commentaire dans mergeAndSave
+    return true;
+  }
+  return false;
+}
+async function pollTick(){
+  if(_syncing || !S.user) return false;
+  const modalOpen = document.getElementById('modalRoot') && document.getElementById('modalRoot').innerHTML.trim().length>0;
+  const typing = document.activeElement && ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
+  if(modalOpen || typing) return false;
+  if(_saveTimer) return false; // une sauvegarde locale est en attente : ne pas écraser avec un simple load
+  try{
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.main&select=updated_at`, {
+      headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY },
+    });
+    const rows = await res.json();
+    const remoteAt = rows && rows[0] && rows[0].updated_at;
+    if(remoteAt && remoteAt !== _remoteUpdatedAt){
+      const ok = await loadStateRemote();
+      if(ok) render();
       return true;
     }
-  }catch(e){ console.warn('TeamFlow sync (chargement) impossible :', e); }
+  }catch{}
   return false;
 }
 function pollRemoteChanges(){
-  setInterval(async ()=>{
-    if(_syncing || !S.user) return;
-    const modalOpen = document.getElementById('modalRoot') && document.getElementById('modalRoot').innerHTML.trim().length>0;
-    const typing = document.activeElement && ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
-    if(modalOpen || typing) return;
-    try{
-      const res = await fetch(`${SUPABASE_URL}/rest/v1/app_state?id=eq.main&select=updated_at`, {
-        headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY },
-      });
-      const rows = await res.json();
-      const remoteAt = rows && rows[0] && rows[0].updated_at;
-      if(remoteAt && remoteAt !== _remoteUpdatedAt){
-        const ok = await loadStateRemote();
-        if(ok) render();
-      }
-    }catch{}
-  }, 8000);
+  setInterval(pollTick, 4000);
 }
 
 function isDesktopViewport(){ try{ return window.matchMedia('(min-width: 860px)').matches; }catch{ return window.innerWidth>=860; } }
@@ -1124,7 +1238,7 @@ function renderNav(){
     return `<div class="nav-item ${S.view===it.v?'active':''}" data-v="${it.v}"><span class="ic">${it.ic}</span>${it.label}${badge}</div>`;
   }).join('');
   document.querySelectorAll('.nav-item').forEach(n=>{
-    n.onclick = ()=>{ if(n.dataset.v==='messages' && S.view!=='messages') S.mobileMsgView='list'; S.view=n.dataset.v; S.projectDetail=null; render(); toggleSidebar(false); };
+    n.onclick = async ()=>{ if((n.dataset.v==='notifications'||n.dataset.v==='dashboard')) await pollTick(); if(n.dataset.v==='messages' && S.view!=='messages') S.mobileMsgView='list'; S.view=n.dataset.v; S.projectDetail=null; render(); toggleSidebar(false); };
   });
   if(S.user.photo){ document.getElementById('whoAvatar').style.background = `center/cover url('${S.user.photo}')`; document.getElementById('whoAvatar').textContent=''; }
   else { document.getElementById('whoAvatar').style.background = avatarColor(S.user.id); document.getElementById('whoAvatar').textContent = initials(S.user.name); }
@@ -1235,6 +1349,8 @@ function viewDashboard(){
     {lbl:'Projets actifs', val:activeProjects, delta:'campagnes & projets', ic:'🚀'},
     {lbl:'Objectifs atteints', val:objAtteints+'%', delta:'sur '+OBJECTIVES.length+' objectifs', ic:'🎯'},
   ];
+  const pendingCount = pendingApprovalTasks().length;
+  kpis.push({lbl:'Actions à valider', val:pendingCount, delta: pendingCount>0?'Déclarées par l\'équipe':'Rien en attente', up:pendingCount===0, down:pendingCount>0, ic:'📝', link:'notifications'});
 
   const teamRows = USERS.filter(u=>u.role!=='admin').map(u=>({u, p:computePerformance(u.id)})).sort((a,b)=>b.p.score-a.p.score);
   const medals=['🥇','🥈','🥉'];
@@ -1279,7 +1395,7 @@ function viewDashboard(){
     </div>
 
     <div class="kpi-grid">
-      ${kpis.map(k=>`<div class="kpi"><div class="lbl">${k.ic} ${k.lbl}</div><div class="val">${k.val}</div><div class="delta ${k.up?'up':k.down?'down':''}">${k.delta}</div></div>`).join('')}
+      ${kpis.map(k=>`<div class="kpi" ${k.link?`style="cursor:pointer;" onclick="S.view='${k.link}'; render();"`:''}><div class="lbl">${k.ic} ${k.lbl}</div><div class="val">${k.val}</div><div class="delta ${k.up?'up':k.down?'down':''}">${k.delta}</div></div>`).join('')}
     </div>
 
     <div class="grid-2">
@@ -1293,7 +1409,7 @@ function viewDashboard(){
           ${workload.length? workload.map(w=>`
             <div class="flex-between" style="padding:8px 0; border-bottom:1px solid var(--border);">
               <div style="display:flex; align-items:center; gap:9px;">
-                <div class="avatar" style="width:28px;height:28px;font-size:11px;background:${avatarColor(w.u.id)}">${initials(w.u.name)}</div>
+                ${avatarHTML(w.u,28,11)}
                 <div><div style="font-size:12.5px; font-weight:600;">${w.u.name}</div><div style="font-size:11px; color:var(--text-muted);">${w.count} tâches actives · ${w.projCount} projets</div></div>
               </div>
               <span class="pill ${w.cls}">${w.dot?`<span class="dot ${w.dot}"></span>`:''}${w.level}</span>
@@ -1340,13 +1456,20 @@ function viewDashboard(){
       <div class="card">
         <div class="card-head"><h3>Activité récente</h3></div>
         <div class="card-body" style="padding:6px 18px;">
-          ${NOTIFICATIONS.length? NOTIFICATIONS.slice(0,5).map(n=>{
-            const st = NOTIF_STYLE[n.type];
-            return `<div style="display:flex; gap:9px; padding:9px 0; border-bottom:1px solid var(--border);">
-              <div class="notif-ic" style="background:${st.bg}; color:${st.color}; width:26px; height:26px; font-size:12px;">${st.ic}</div>
+          ${(()=>{
+            const scoped = S.user.role==='admin' ? NOTIFICATIONS : NOTIFICATIONS.filter(n=>{
+              const toU = userByIdSafe(n.to); return toU.departmentId===S.user.departmentId || n.to===S.user.id;
+            });
+            const recent = scoped.slice(0,5);
+            return recent.length? recent.map(n=>{
+              const st = NOTIF_STYLE[n.type];
+              const fromU = n.from ? userByIdSafe(n.from) : userByIdSafe(n.to);
+              return `<div style="display:flex; gap:9px; padding:9px 0; border-bottom:1px solid var(--border); cursor:${n.taskId?'pointer':'default'};" ${n.taskId?`onclick="goToSearchResult('task','${n.taskId}')"`:''}>
+              ${avatarHTML(fromU,26,10)}
               <div style="font-size:12.5px;">${n.text}<div style="font-size:10.5px; color:var(--text-faint); margin-top:2px;">${new Date(n.at).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</div></div>
             </div>`;
-          }).join('') : `<div class="empty">Aucune activité récente.</div>`}
+            }).join('') : `<div class="empty">Aucune activité récente.</div>`;
+          })()}
         </div>
       </div>
     </div>
@@ -1426,7 +1549,7 @@ function openPlanDetail(userId){
 }
 function approvePlan(uid){
   PLAN_STATUS[uid]='validé';
-  NOTIFICATIONS.unshift({id:uid+'_valid_'+Date.now(), type:'validation', text:'Votre plan du jour a été validé.', to:uid, at:SIM_NOW.toISOString(), read:false});
+  NOTIFICATIONS.unshift({id:uid+'_valid_'+Date.now(), type:'validation', text:'Votre plan du jour a été validé.', to:uid, from:S.user.id, at:SIM_NOW.toISOString(), read:false});
   toast(userByIdSafe(uid).name+' : plan validé — la journée peut démarrer.'); render();
 }
 
@@ -1571,12 +1694,16 @@ function renderTaskCard(t){
     if(t.status==='En pause') actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Reprendre</button>`;
     if(t.status==='Bloquée') actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Débloquer</button>`;
   }
+  if(t.approval==='pending' && (S.user.role==='manager' || S.user.role==='admin')){
+    actions += `<button class="btn btn-primary btn-sm" onclick="approveActivity('${t.id}')">✅ Approuver</button><button class="btn btn-danger btn-sm" onclick="rejectActivity('${t.id}')">🚫 Rejeter</button>`;
+  }
   return `
   <div class="task-card">
     <div class="task-top">
+      ${S.user.role!=='collab' && t.assignee!==S.user.id ? avatarHTML(userByIdSafe(t.assignee),30,11) : ''}
       <div class="prio prio-${t.priority}"></div>
       <div style="flex:1;">
-        <div class="task-title">${t.title} ${t.assignedByManager?'<span class="pill pill-info" style="margin-left:4px;">Assignée</span>':''} ${t.recurring?'<span class="pill pill-muted" style="margin-left:4px;">🔁 Récurrente</span>':''}</div>
+        <div class="task-title">${t.title} ${t.assignedByManager?'<span class="pill pill-info" style="margin-left:4px;">Assignée</span>':''} ${t.recurring?'<span class="pill pill-muted" style="margin-left:4px;">🔁 Récurrente</span>':''} ${t.approval==='pending'?'<span class="pill pill-warn" style="margin-left:4px;">⏳ À valider</span>':''}</div>
         <div class="task-meta">
           <span class="pill pill-muted">${t.category}</span>
           <span>${priorityLabel(t.priority)}</span>
@@ -1655,11 +1782,13 @@ function confirmAddActivity(){
   const projId = document.getElementById('naProj').value;
   const proj = PROJECTS.find(p=>p.id===projId);
   const day = PLAN_DAY[S.user.id] || todayISO();
-  TASKS.push({id:uid('t'), title, category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
+  const newId = uid('t');
+  TASKS.push({id:newId, title, category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
     assignee:S.user.id, project:projId, phase:proj.currentPhase, duration:document.getElementById('naDur').value||'1h',
     date:day, deadline:day, deadlineTime:document.getElementById('naDeadlineTime').value||WORK_END, status:'À faire', deliverables:[], comments:[],
-    expectedDeliverable:document.getElementById('naDeliv').value});
-  closeModal(); render(); toast('Activité ajoutée à votre plan — '+proj.name);
+    expectedDeliverable:document.getElementById('naDeliv').value, approval:'pending'});
+  notifyManagers({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
+  closeModal(); render(); toast('Activité ajoutée à votre plan — en attente de validation par votre responsable.');
 }
 function submitPlan(){
   PLAN_STATUS[S.user.id]='soumis';
@@ -1691,7 +1820,7 @@ function confirmAssign(uid_){
   const proj = PROJECTS.find(p=>p.id===projId);
   TASKS.push({id:uid('t'), title, category:document.getElementById('asCat').value, priority:document.getElementById('asPrio').value, assignee, project:projId, phase:proj.currentPhase,
     duration:'1h', date:todayISO(), deadline:document.getElementById('asDeadline').value, status:'À faire', deliverables:[], comments:[], assignedByManager:true});
-  NOTIFICATIONS.unshift({id:uid('n'), type:'tache', text:`Une nouvelle tâche vous a été assignée : « ${title} » (${proj.name}).`, to:assignee, at:SIM_NOW.toISOString(), read:false});
+  NOTIFICATIONS.unshift({id:uid('n'), type:'tache', text:`Une nouvelle tâche vous a été assignée : « ${title} » (${proj.name}).`, to:assignee, from:S.user.id, taskId:TASKS[TASKS.length-1].id, at:SIM_NOW.toISOString(), read:false});
   closeModal(); render(); toast('Tâche assignée à '+userByIdSafe(assignee).name);
 }
 function openCloseDay(){
@@ -1768,6 +1897,7 @@ function submitDayReport(day, unfinishedCount){
   const efficiency = document.getElementById('drEff').value;
   const comment = document.getElementById('drComment').value.trim();
   DAY_REPORTS.push({id:uid('dr'), user:S.user.id, day, efficiency, comment, at:SIM_NOW.toISOString()});
+  notifyManagers({type:'tache', text:`${S.user.name} a clôturé sa journée du ${fmtDate(day)} — efficacité : ${DAY_EFFICIENCY[efficiency].label}.`});
   closeModal(); render();
   toast('Votre rapport a été envoyé au responsable.');
 }
@@ -1780,11 +1910,19 @@ function openTaskDetail(id){
   const t = TASKS.find(x=>x.id===id);
   const proj = t.project? PROJECTS.find(p=>p.id===t.project):null;
   const canAppreciate = (S.user.role==='manager'||S.user.role==='admin') && t.status==='Terminée';
+  const canApprove = (S.user.role==='manager'||S.user.role==='admin') && t.approval==='pending';
   openModal(`<div class="modal-head"><h3>${t.title}</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
-    <div class="task-meta" style="margin-bottom:12px;">${statusPill(t.status)}<span class="pill pill-muted">${t.category}</span><span>${priorityLabel(t.priority)}</span>${proj?`<span class="pill pill-accent">🚀 ${proj.name}</span>`:''}</div>
-    <div style="font-size:12.5px; color:var(--text-muted); margin-bottom:14px;">Assignée à <b>${userByIdSafe(t.assignee).name}</b> · Échéance ${fmtDate(t.deadline)}</div>
+    <div class="task-meta" style="margin-bottom:12px;">${statusPill(t.status)}<span class="pill pill-muted">${t.category}</span><span>${priorityLabel(t.priority)}</span>${proj?`<span class="pill pill-accent">🚀 ${proj.name}</span>`:''}${t.approval==='pending'?'<span class="pill pill-warn">⏳ À valider</span>':t.approval==='approved'?'<span class="pill pill-success">✅ Validée</span>':t.approval==='rejected'?'<span class="pill pill-crit">🚫 Rejetée</span>':''}</div>
+    <div style="display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-muted); margin-bottom:14px;">${avatarHTML(userByIdSafe(t.assignee),22,9)}Assignée à <b>${userByIdSafe(t.assignee).name}</b> · Échéance ${fmtDate(t.deadline)}</div>
     ${t.deliverables.length?`<h4 style="font-size:12px; text-transform:uppercase; color:var(--text-muted); margin:0 0 8px;">Livrables</h4>${t.deliverables.map(d=>`<div class="pill pill-muted" style="margin:0 6px 6px 0;">📎 ${d.name}</div>`).join('')}`:''}
+    ${canApprove?`<div style="margin:14px 0; padding:12px; border:1px dashed var(--warn); border-radius:10px; background:var(--warn-bg);">
+      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px; text-transform:uppercase; letter-spacing:.05em;">Activité déclarée par le collaborateur — à valider</div>
+      <div class="task-actions">
+        <button class="btn btn-primary btn-sm" onclick="approveActivity('${t.id}')">✅ Approuver</button>
+        <button class="btn btn-danger btn-sm" onclick="rejectActivity('${t.id}')">🚫 Rejeter</button>
+      </div>
+    </div>`:''}
     ${t.appreciation?`<div style="margin:14px 0; padding:10px 12px; border-radius:10px; background:var(--surface-2); border-left:3px solid ${APPRECIATION_STYLE[t.appreciation.type].color};">
       <div style="font-weight:700; font-size:12.5px;">${APPRECIATION_STYLE[t.appreciation.type].ic} ${APPRECIATION_STYLE[t.appreciation.type].label} par ${userByIdSafe(t.appreciation.by).name}</div>
       ${t.appreciation.comment?`<div style="font-size:12.5px; margin-top:3px;">${t.appreciation.comment}</div>`:''}
@@ -1799,7 +1937,7 @@ function openTaskDetail(id){
       </div>
     </div>`:''}
     <h4 style="font-size:12px; text-transform:uppercase; color:var(--text-muted); margin:16px 0 4px;">Discussion</h4>
-    <div>${t.comments.length? t.comments.map(c=>`<div class="comment"><div class="avatar" style="width:26px;height:26px;font-size:10px;background:${avatarColor(c.who)}">${initials(userByIdSafe(c.who).name)}</div><div><div class="who-line">${userByIdSafe(c.who).name}<span class="when">${new Date(c.at).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</span></div><div class="bubble">${c.text}</div></div></div>`).join('') : `<div class="empty" style="padding:14px;">Aucun échange pour le moment.</div>`}</div>
+    <div>${t.comments.length? t.comments.map(c=>`<div class="comment">${avatarHTML(userByIdSafe(c.who),26,10)}<div><div class="who-line">${userByIdSafe(c.who).name}<span class="when">${new Date(c.at).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</span></div><div class="bubble">${c.text}</div></div></div>`).join('') : `<div class="empty" style="padding:14px;">Aucun échange pour le moment.</div>`}</div>
     <div class="field" style="margin-top:12px;"><textarea id="newComment" rows="2" placeholder="Écrire un commentaire…"></textarea></div>
   </div>
   <div class="modal-foot">
@@ -1811,6 +1949,31 @@ function addComment(id){
   TASKS.find(t=>t.id===id).comments.push({who:S.user.id, text:val, at:SIM_NOW.toISOString()});
   openTaskDetail(id);
 }
+/* =========================== VALIDATION DES ACTIVITÉS AUTO-DÉCLARÉES =========================== */
+function pendingApprovalTasks(){
+  return TASKS.filter(t=>t.approval==='pending' && (S.user.role==='admin' || userByIdSafe(t.assignee).departmentId===S.user.departmentId));
+}
+function approveActivity(id){
+  const t = TASKS.find(x=>x.id===id); if(!t) return;
+  t.approval = 'approved';
+  t.comments.push({who:S.user.id, text:'✅ Activité validée par le responsable.', at:SIM_NOW.toISOString()});
+  NOTIFICATIONS.unshift({id:uid('n'), type:'validation', text:`Votre activité « ${t.title} » a été validée par ${S.user.name}.`, to:t.assignee, from:S.user.id, taskId:t.id, at:SIM_NOW.toISOString(), read:false});
+  closeModal(); render(); toast('Activité validée — '+userByIdSafe(t.assignee).name+' a été notifié(e).');
+}
+function rejectActivity(id){
+  openModal(`<div class="modal-head"><h3>Rejeter l'activité</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
+  <div class="modal-body"><div class="field"><label>Motif du rejet</label><textarea id="rejectReason" rows="3" placeholder="Expliquez pourquoi cette activité est rejetée."></textarea></div></div>
+  <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Annuler</button><button class="btn btn-danger" onclick="confirmRejectActivity('${id}')">Rejeter</button></div>`);
+}
+function confirmRejectActivity(id){
+  const t = TASKS.find(x=>x.id===id); if(!t) return;
+  const reason = document.getElementById('rejectReason').value.trim();
+  if(!reason){ toast('Un motif est requis.'); return; }
+  t.approval = 'rejected';
+  t.comments.push({who:S.user.id, text:`🚫 Activité rejetée — ${reason}`, at:SIM_NOW.toISOString()});
+  NOTIFICATIONS.unshift({id:uid('n'), type:'blocage', text:`Votre activité « ${t.title} » a été rejetée par ${S.user.name} : ${reason}`, to:t.assignee, from:S.user.id, taskId:t.id, at:SIM_NOW.toISOString(), read:false});
+  closeModal(); render(); toast('Activité rejetée — '+userByIdSafe(t.assignee).name+' a été notifié(e).');
+}
 function appreciateTask(id, type){
   const t = TASKS.find(x=>x.id===id);
   const comment = document.getElementById('apprecComment').value.trim();
@@ -1820,9 +1983,9 @@ function appreciateTask(id, type){
   t.comments.push({who:S.user.id, text:`${st.ic} ${st.label}${comment?' — '+comment:''}`, at:SIM_NOW.toISOString()});
   if(type==='insatisfaisant'){
     t.status = 'Correction demandée';
-    NOTIFICATIONS.unshift({id:uid('n'), type:'blocage', text:`Votre responsable demande une reprise sur « ${t.title} » : ${comment}`, to:t.assignee, at:SIM_NOW.toISOString(), read:false});
+    NOTIFICATIONS.unshift({id:uid('n'), type:'blocage', text:`Votre responsable demande une reprise sur « ${t.title} » : ${comment}`, to:t.assignee, from:S.user.id, taskId:t.id, at:SIM_NOW.toISOString(), read:false});
   } else {
-    NOTIFICATIONS.unshift({id:uid('n'), type:'validation', text:`${st.ic} Votre responsable vous a ${type==='felicite'?'félicité':'apprécié'} pour « ${t.title} ».`, to:t.assignee, at:SIM_NOW.toISOString(), read:false});
+    NOTIFICATIONS.unshift({id:uid('n'), type:'validation', text:`${st.ic} Votre responsable vous a ${type==='felicite'?'félicité':'apprécié'} pour « ${t.title} ».`, to:t.assignee, from:S.user.id, taskId:t.id, at:SIM_NOW.toISOString(), read:false});
   }
   closeModal(); render(); toast(type==='insatisfaisant' ? 'Reprise demandée à '+userByIdSafe(t.assignee).name : st.label+' — '+userByIdSafe(t.assignee).name+' a été notifié(e).');
 }
@@ -2718,12 +2881,29 @@ function changeMonth(delta){ S.calMonth+=delta; if(S.calMonth<0){S.calMonth=11; 
 function viewNotifications(){
   const mine = NOTIFICATIONS.filter(n=>n.to===S.user.id);
   mine.forEach(n=>n.read=true);
+  const isManager = S.user.role==='manager' || S.user.role==='admin';
+  const pending = isManager ? pendingApprovalTasks() : [];
   return `
+  ${isManager?`
+  <div class="section-title">Actions à valider</div>
+  <p class="section-sub">${pending.length} activité(s) déclarée(s) par votre équipe en attente de validation</p>
+  <div class="card" style="margin-bottom:22px;">${pending.length? pending.map(t=>`
+    <div class="notif-row" style="cursor:pointer;" onclick="openTaskDetail('${t.id}')">
+      ${avatarHTML(userByIdSafe(t.assignee),34,12)}
+      <div style="flex:1;"><div style="font-size:13px;"><b>${userByIdSafe(t.assignee).name}</b> — ${t.title}</div><div style="font-size:11px; color:var(--text-faint); margin-top:3px;">${fmtDate(t.date)} · ${t.category}</div></div>
+      <div style="display:flex; gap:6px;">
+        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); approveActivity('${t.id}')">✅</button>
+        <button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); rejectActivity('${t.id}')">🚫</button>
+      </div>
+    </div>`).join('') : `<div class="empty">Aucune activité en attente.</div>`}</div>
+  `:''}
   <div class="section-title">Notifications</div>
   <p class="section-sub">${mine.length} notification(s)</p>
-  <div class="card">${mine.length? mine.map(n=>{const st=NOTIF_STYLE[n.type]; return `
-    <div class="notif-row ${!n.read?'unread':''}">
-      <div class="notif-ic" style="background:${st.bg}; color:${st.color};">${st.ic}</div>
+  <div class="card">${mine.length? mine.map(n=>{const st=NOTIF_STYLE[n.type]; const clickable = n.taskId ? `style="cursor:pointer;" onclick="goToSearchResult('task','${n.taskId}')"` : '';
+    const fromUser = n.from ? userByIdSafe(n.from) : null;
+    return `
+    <div class="notif-row ${!n.read?'unread':''}" ${clickable}>
+      ${fromUser ? avatarHTML(fromUser,34,12) : `<div class="notif-ic" style="background:${st.bg}; color:${st.color};">${st.ic}</div>`}
       <div style="flex:1;"><div style="font-size:13px;">${n.text}</div><div style="font-size:11px; color:var(--text-faint); margin-top:3px;">${new Date(n.at).toLocaleString('fr-FR',{day:'2-digit',month:'long',hour:'2-digit',minute:'2-digit'})}</div></div>
     </div>`;}).join('') : `<div class="empty">Aucune notification.</div>`}</div>`;
 }
@@ -3002,7 +3182,7 @@ function confirmScheduleMeeting(){
   if(!participants.includes(S.user.id)) participants.push(S.user.id);
   const at = document.getElementById('mtDate').value+'T'+document.getElementById('mtTime').value;
   MEETINGS.push({id:uid('mt'), title, at, by:S.user.id, participants});
-  participants.filter(p=>p!==S.user.id).forEach(p=>NOTIFICATIONS.unshift({id:uid('n'), type:'projet', text:`${S.user.name} vous a invité(e) à la réunion « ${title} » le ${new Date(at).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}.`, to:p, at:SIM_NOW.toISOString(), read:false}));
+  participants.filter(p=>p!==S.user.id).forEach(p=>NOTIFICATIONS.unshift({id:uid('n'), type:'projet', text:`${S.user.name} vous a invité(e) à la réunion « ${title} » le ${new Date(at).toLocaleString('fr-FR',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}.`, to:p, from:S.user.id, at:SIM_NOW.toISOString(), read:false}));
   closeModal(); render(); toast('Réunion programmée et invitations envoyées.');
 }
 
@@ -3142,7 +3322,7 @@ function renderPost(p){
         <button class="feed-action" onclick="sharePost('${p.id}')">↗ Partager</button>
       </div>
       <div id="comments_${p.id}">
-        ${p.comments.length? `<div style="margin-top:10px;">${p.comments.map(c=>`<div class="comment"><div class="avatar" style="width:26px;height:26px;font-size:10px;background:${avatarColor(c.who)}">${initials(userByIdSafe(c.who).name)}</div><div><div class="who-line">${userByIdSafe(c.who).name}<span class="when">${timeAgo(c.at)}</span></div><div class="bubble">${escapeHtml(c.text)}</div></div></div>`).join('')}</div>` : ''}
+        ${p.comments.length? `<div style="margin-top:10px;">${p.comments.map(c=>`<div class="comment">${avatarHTML(userByIdSafe(c.who),26,10)}<div><div class="who-line">${userByIdSafe(c.who).name}<span class="when">${timeAgo(c.at)}</span></div><div class="bubble">${escapeHtml(c.text)}</div></div></div>`).join('')}</div>` : ''}
       </div>
       <div id="commentBox_${p.id}" style="display:none; margin-top:10px; gap:8px; align-items:center;">
         ${avatarHTML(S.user,26,10)}
@@ -3279,7 +3459,7 @@ document.getElementById('switchUserBtn').onclick = ()=>{
   document.getElementById('app').classList.remove('active');
   if(isDesktopViewport()) showLanding(); else showLoginScreen();
 };
-document.getElementById('notifBtn').onclick = ()=>{ S.view='notifications'; render(); };
+document.getElementById('notifBtn').onclick = async ()=>{ await pollTick(); S.view='notifications'; render(); };
 document.getElementById('whoBtn').onclick = ()=>openMyProfile();
 document.getElementById('menuBtn').onclick = ()=>toggleSidebar();
 document.getElementById('sidebarBackdrop').onclick = ()=>toggleSidebar(false);
