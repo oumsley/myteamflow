@@ -2050,7 +2050,18 @@ function pendingApprovalTasks(){
 }
 function approveActivity(id){
   const t = TASKS.find(x=>x.id===id); if(!t) return;
+  /* Garde d'idempotence — CŒUR du correctif du bug de notification en double constaté en
+     production (deux notifications "validation" quasi identiques à 5 minutes d'intervalle pour
+     la même tâche). Si l'activité n'est déjà plus "en attente" (déjà validée -- double-clic,
+     ré-ouverture du même modal, ou second onglet/appareil du même responsable pas encore
+     resynchronisé -- ou déjà rejetée entre-temps), on ne fait STRICTEMENT rien de plus : pas de
+     second commentaire, pas de seconde notification. approveActivity() devient ainsi un no-op
+     sûr quel que soit le nombre de fois où il est invoqué pour une même tâche déjà traitée. */
+  if(t.approval!=='pending'){ closeModal(); render(); return; }
   t.approval = 'approved';
+  /* Garantie explicite (pas un hasard des données) : une activité validée repart TOUJOURS dans
+     un état que le collaborateur peut démarrer, quel qu'ait été son statut à la soumission. */
+  if(t.status!=='À faire' && t.status!=='En retard') t.status = 'À faire';
   t.comments.push({who:S.user.id, text:'✅ Activité validée par le responsable.', at:SIM_NOW.toISOString()});
   NOTIFICATIONS.unshift({id:uid('n'), type:'validation', text:`Votre activité « ${t.title} » a été validée par ${S.user.name}.`, to:t.assignee, from:S.user.id, taskId:t.id, at:SIM_NOW.toISOString(), read:false});
   closeModal(); render(); toast('Activité validée — '+userByIdSafe(t.assignee).name+' a été notifié(e).');
@@ -2062,6 +2073,9 @@ function rejectActivity(id){
 }
 function confirmRejectActivity(id){
   const t = TASKS.find(x=>x.id===id); if(!t) return;
+  /* Même garde d'idempotence qu'approveActivity() : un rejet déjà traité (ou une activité
+     entre-temps approuvée par ailleurs) ne doit jamais générer une seconde notification. */
+  if(t.approval!=='pending'){ closeModal(); render(); return; }
   const reason = document.getElementById('rejectReason').value.trim();
   if(!reason){ toast('Un motif est requis.'); return; }
   t.approval = 'rejected';
@@ -2592,6 +2606,28 @@ function openProject(id){ S.projectDetail=id; render(); }
 function canManageProject(p){
   return S.user.role==='admin' || (S.user.role==='manager' && p.manager===S.user.id);
 }
+/* =========================== PHASES — CORRÉLATION PROJET ↔ TÂCHES =========================== */
+/* Une tâche/activité hérite de la phase COURANTE de son projet au moment de sa création
+   (confirmAddActivity, confirmAssign : phase:proj.currentPhase) — c'est la seule règle de
+   corrélation qui a du sens, car une phase de projet n'existe que via les tâches qui y sont
+   effectivement rattachées ; il n'y a donc rien à "dériver" ailleurs.
+   Le morceau qui manquait est la SYNCHRONISATION quand le projet avance à la phase suivante :
+   advanceProjectPhase() ci-dessous ne fait avancer que les tâches encore dans l'ancienne phase
+   courante ET pas encore terminées — une tâche déjà "Terminée" garde sa phase d'origine comme
+   trace historique de quand elle a réellement été faite, elle n'est jamais réécrite après coup. */
+function advanceProjectPhase(id){
+  const p = PROJECTS.find(x=>x.id===id);
+  if(!p || !canManageProject(p)){ toast("Vous n'avez pas le droit de modifier ce projet."); return; }
+  const idx = PHASES.indexOf(p.currentPhase);
+  if(idx<0 || idx>=PHASES.length-1){ toast('Ce projet est déjà à la dernière phase.'); return; }
+  const oldPhase = p.currentPhase;
+  const newPhase = PHASES[idx+1];
+  p.currentPhase = newPhase;
+  const moved = TASKS.filter(t=>t.project===id && t.phase===oldPhase && t.status!=='Terminée');
+  moved.forEach(t=>{ t.phase = newPhase; });
+  render();
+  toast(`Projet passé à la phase « ${newPhase} »${moved.length?` — ${moved.length} tâche(s) en cours suivent le mouvement`:''}.`);
+}
 function projectDetailView(id){
   const p = PROJECTS.find(x=>x.id===id);
   const tasks = TASKS.filter(t=>t.project===id);
@@ -2625,7 +2661,7 @@ function projectDetailView(id){
   <div class="grid-2">
     <div>
       <div class="card" style="margin-bottom:16px;">
-        <div class="card-head"><h3>Phases du projet</h3></div>
+        <div class="card-head flex-between"><h3>Phases du projet</h3>${canManage && PHASES.indexOf(p.currentPhase)<PHASES.length-1 ? `<button class="btn btn-outline btn-sm" onclick="advanceProjectPhase('${p.id}')">Passer à « ${PHASES[PHASES.indexOf(p.currentPhase)+1]} » →</button>` : ''}</div>
         <div class="card-body">
           ${PHASES.map(ph=>{
             const pt = tasks.filter(t=>t.phase===ph);
