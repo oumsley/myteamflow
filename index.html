@@ -475,6 +475,22 @@
   .report-stat span{ font-size:11.5px; color:var(--text-muted); }
   .rank-line{ display:flex; align-items:center; gap:10px; padding:6px 0; font-size:13px; }
 
+  /* ---------- Bilan des activités de l'équipe (rapport structuré, imprimable) ---------- */
+  .bilan-controls{ background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:10px 14px; }
+  .bilan-section{ margin-bottom:26px; padding-bottom:4px; border-bottom:1px solid var(--border); }
+  .bilan-section:last-child{ border-bottom:none; }
+  .bilan-section-head{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:12px; padding-bottom:10px; border-bottom:2px solid var(--brand); }
+  .bilan-section-stats{ font-size:11.5px; color:var(--text-muted); font-weight:600; }
+  .bilan-task{ padding:10px 0; border-top:1px dashed var(--border); }
+  .bilan-section-head + .bilan-task{ border-top:none; }
+  .bilan-task-head{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:4px; }
+  .bilan-task-title{ font-weight:700; font-size:13.5px; }
+  .bilan-task-meta{ display:flex; flex-wrap:wrap; gap:12px; font-size:11.5px; color:var(--text-muted); margin-bottom:4px; }
+  .bilan-task-desc{ font-size:12.5px; color:var(--text); background:var(--surface-2); border-radius:8px; padding:7px 10px; margin:4px 0; white-space:pre-wrap; }
+  .bilan-task-foot{ display:flex; flex-wrap:wrap; gap:16px; font-size:11.5px; color:var(--text-muted); }
+  .bilan-task-app{ font-size:11.5px; font-weight:600; margin-top:4px; }
+  .bilan-dayreports{ font-size:11.5px; color:var(--text-muted); margin-top:8px; padding-top:8px; border-top:1px dashed var(--border); }
+
   /* ---------- Messages / chat ---------- */
   .msg-shell{ display:grid; grid-template-columns:260px 1fr; height:calc(100vh - 150px); min-height:480px; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; background:var(--surface); box-shadow:var(--shadow); }
   .msg-list{ border-right:1px solid var(--border); overflow-y:auto; background:var(--surface-2); }
@@ -541,7 +557,7 @@
   .toast{ position:fixed; bottom:20px; right:20px; background:var(--dark); color:#fff; padding:12px 18px; border-radius:10px; font-size:13px; box-shadow:var(--shadow); z-index:80; display:flex; align-items:center; gap:8px; }
 
   @media print{
-    .sidebar, .topbar, .toast, .modal-back, #reportOut ~ *, .flex-between button, .flex-between select, .bottom-nav, .fab-btn, .fab-menu { display:none !important; }
+    .sidebar, .topbar, .toast, .modal-back, #reportOut ~ *, .flex-between button, .flex-between select, .bottom-nav, .fab-btn, .fab-menu, #bilanControlsWrap { display:none !important; }
     body, .content{ background:#fff !important; margin:0; padding:0; }
     .main{ display:block !important; }
     .report-doc{ box-shadow:none; border:none; }
@@ -862,7 +878,7 @@ const NAV = {
     {v:'dashboard', ic:'🏠', label:'Dashboard'},
     {v:'myday', ic:'📅', label:'Ma journée'},
     {v:'team', ic:'👥', label:'Mon équipe'},
-    {v:'tasks', ic:'✓', label:'Actions'},
+    {v:'tasks', ic:'📊', label:'Bilan équipe'},
     {v:'feed', ic:'📰', label:"Fil d'actualité"},
     {v:'projects', ic:'🚀', label:'Projets & Campagnes'},
     {v:'objectives', ic:'🎯', label:'Objectifs'},
@@ -900,7 +916,7 @@ const NAV = {
 const PAGE_TITLES = {dashboard:'Dashboard', myday:'Ma journée', team:'Mon équipe', tasks:'Actions', feed:"Fil d'actualité", messages:'Messages', projects:'Projets & Campagnes', objectives:'Objectifs', performance:'Performance', calendar:'Calendrier', reports:'Rapports', notifications:'Notifications', settings:'Paramètres', profile:'Profil'};
 /* Sous-ensemble de la navigation pour la barre du bas (mobile) : 4 raccourcis + "Plus" */
 const BOTTOM_NAV = {
-  manager: [ {v:'dashboard', ic:'🏠', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'✓', label:'Actions'}, {v:'messages', ic:'💬', label:'Messages'} ],
+  manager: [ {v:'dashboard', ic:'🏠', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'📊', label:'Bilan'}, {v:'messages', ic:'💬', label:'Messages'} ],
   admin: [ {v:'dashboard', ic:'🏠', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'team', ic:'👥', label:'Utilisateurs'}, {v:'messages', ic:'💬', label:'Messages'} ],
   collab: [ {v:'myday', ic:'📅', label:'Accueil'}, {v:'feed', ic:'📰', label:'Actu'}, {v:'tasks', ic:'✓', label:'Récaps'}, {v:'messages', ic:'💬', label:'Messages'} ],
 };
@@ -915,6 +931,12 @@ function notifyManagers(payload){
   const deptId = S.user && S.user.departmentId;
   const targets = deptId ? USERS.filter(u=>u.role==='manager' && u.departmentId===deptId).map(u=>u.id) : managerIds();
   targets.forEach(mid=>NOTIFICATIONS.unshift({id:uid('n'), to:mid, from:S.user.id, at:SIM_NOW.toISOString(), read:false, ...payload}));
+}
+/* Un responsable ne pouvant jamais valider sa propre activité (voir canApproveTask), ses
+   propres actions déclarées remontent aux administrateurs plutôt qu'à ses pairs responsables. */
+function notifyAdmins(payload){
+  const targets = USERS.filter(u=>u.role==='admin').map(u=>u.id);
+  targets.forEach(aid=>NOTIFICATIONS.unshift({id:uid('n'), to:aid, from:S.user.id, at:SIM_NOW.toISOString(), read:false, ...payload}));
 }
 function toast(msg){
   const t = el(`<div class="toast">✓ ${msg}</div>`);
@@ -1302,7 +1324,7 @@ function renderNav(){
   else { document.getElementById('whoAvatar').style.background = avatarColor(S.user.id); document.getElementById('whoAvatar').textContent = initials(S.user.name); }
   document.getElementById('whoName').textContent = S.user.nickname ? `${S.user.name} · ${S.user.nickname}` : S.user.name;
   document.getElementById('whoRole').textContent = roleLabel[S.user.role];
-  document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user && S.user.role==='collab') ? 'Mes Récaps' : (PAGE_TITLES[S.view] || '');
+  document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user) ? (S.user.role==='collab' ? 'Mes Récaps' : 'Bilan de l\'équipe') : (PAGE_TITLES[S.view] || '');
   const dept = currentDept();
   const brandMarkEl = document.getElementById('brandMark');
   if(dept){
@@ -1548,7 +1570,20 @@ function viewMyDay(){
     const groups = {validé:[], soumis:[], brouillon:[]};
     collabs.forEach(u=>{ (groups[PLAN_STATUS[u.id]]||groups.brouillon).push(u); });
     const total = collabs.length;
+    /* Activités déclarées EN COURS DE JOURNÉE (après validation du plan) qui attendent une
+       validation individuelle — canApproveTask() applique déjà le bon périmètre (département
+       pour un responsable, tout pour un admin, jamais ses propres activités). C'est un concept
+       distinct de la validation "en bloc" des plans du jour ci-dessous : on ne duplique donc rien,
+       on affiche simplement les deux files d'attente, chacune à sa juste place et clairement
+       nommée, avant le propre programme du responsable. */
+    const pendingActs = pendingApprovalTasks();
     return `
+    <div class="section-title">📝 Activités à valider</div>
+    <p class="section-sub">${pendingActs.length} activité(s) déclarée(s) par votre équipe en cours de journée, en attente de votre validation</p>
+    <div class="card" style="margin-bottom:24px;">
+      <div class="card-body">${pendingActs.length? pendingActs.map(t=>renderTaskCard(t)).join('') : `<div class="empty">Aucune activité en attente de validation individuelle pour l'instant.</div>`}</div>
+    </div>
+
     <div class="flex-between" style="margin-bottom:16px;">
       <div><div class="section-title">Validation des plans journaliers</div><p class="section-sub">${fmtDate(todayISO())} · ${groups['validé'].length}/${total} validés · ${groups['soumis'].length} en attente · ${groups['brouillon'].length} pas encore reçus</p></div>
     </div>
@@ -1567,7 +1602,12 @@ function viewMyDay(){
         </div>`;
       }).join('')}
     </div>
-    <div style="margin-top:18px;">${renderOwnDay(S.user)}</div>
+
+    <div style="margin-top:24px;">
+      <div class="section-title" style="margin-bottom:2px;">📅 Mon programme du jour</div>
+      <p class="section-sub" style="margin-bottom:14px;">Vos propres activités planifiées pour aujourd'hui — distinctes de celles de votre équipe ci-dessus</p>
+      ${renderOwnDay(S.user)}
+    </div>
     `;
   }
   return renderOwnDay(S.user, true);
@@ -1942,14 +1982,20 @@ function confirmAddActivity(){
      marquait TOUJOURS approval:'pending', y compris pour un simple ajout au brouillon -- ce qui
      laissait ces tâches indéfiniment "en attente" aux yeux du responsable même après validation du
      plan entier, polluant "Actions à valider" avec des activités déjà couvertes par ailleurs. */
-  const needsIndividualApproval = S.user.role==='collab' && PLAN_STATUS[S.user.id]==='validé';
+  /* Un responsable a lui aussi ses propres actions planifiées (voir renderOwnDay/viewMyDay) et
+     doit être soumis à la même règle de validation qu'un collaborateur — sauf qu'un responsable
+     ne peut jamais s'auto-valider (voir canApproveTask) : c'est donc un administrateur qui
+     valide les activités propres d'un responsable. Un administrateur, lui, n'est soumis à aucun
+     circuit d'approbation individuelle (il n'y a personne au-dessus pour valider). */
+  const needsIndividualApproval = S.user.role==='collab' ? PLAN_STATUS[S.user.id]==='validé' : S.user.role==='manager';
   TASKS.push({id:newId, title, description:document.getElementById('naDesc').value.trim(), category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
     assignee:S.user.id, project:projId, phase:proj.currentPhase, duration:document.getElementById('naDur').value||'1h',
     date:day, deadline:day, deadlineTime:document.getElementById('naDeadlineTime').value||WORK_END, status:'À faire', deliverables:[], comments:[],
     expectedDeliverable:document.getElementById('naDeliv').value, approval: needsIndividualApproval ? 'pending' : null});
   if(needsIndividualApproval){
-    notifyManagers({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
-    closeModal(); render(); toast('Activité ajoutée à votre plan — en attente de validation par votre responsable.');
+    if(S.user.role==='manager') notifyAdmins({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
+    else notifyManagers({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
+    closeModal(); render(); toast('Activité ajoutée à votre plan — en attente de validation.');
   } else {
     closeModal(); render(); toast('Activité ajoutée à votre plan.');
   }
@@ -2190,8 +2236,8 @@ function dynamicBadges(userId){
    Remplace, pour le collaborateur, l'ancienne vue "Mes actions" (liste plate par statut) par un
    véritable historique de ses activités, filtrable jour / semaine / mois, avec un bouton
    d'impression/export PDF natif (window.print() + feuille de style @media print déjà en place
-   pour les Rapports, étendue ici à #recapPrintArea). Les responsables/admin conservent l'ancienne
-   vue "Toutes les actions" (viewTasks) inchangée — voir viewTasksOrRecap(). */
+   pour les Rapports, étendue ici à #recapPrintArea). Les responsables/admin voient à la place un
+   véritable rapport d'équipe structuré — voir viewTeamBilan() et viewTasksOrRecap(). */
 function periodBounds(period){
   const today = todayISO();
   if(period==='week'){
@@ -2208,11 +2254,15 @@ function periodBounds(period){
   }
   return {from:today, to:today, label:fmtDate(today)};
 }
-function viewTasksOrRecap(){ return (S.user && S.user.role==='collab') ? viewMyRecap() : viewTasks(); }
+function viewTasksOrRecap(){ return (S.user && S.user.role==='collab') ? viewMyRecap() : viewTeamBilan(); }
 function viewMyRecap(){
   const period = S.recapPeriod = S.recapPeriod || 'day';
   const {from,to,label} = periodBounds(period);
-  const mine = TASKS.filter(t=>t.assignee===S.user.id && t.date>=from && t.date<=to);
+  /* Un récap est un historique de ce qui a été (ou est en train d'être) fait — pas la file
+     d'attente de validation : une activité encore "pending" n'a pas d'existence officielle tant
+     que le responsable ne l'a pas validée, elle ne doit donc jamais apparaître ici (elle reste
+     visible uniquement dans le plan du jour / "Activités à valider" jusqu'à sa validation). */
+  const mine = TASKS.filter(t=>t.assignee===S.user.id && t.date>=from && t.date<=to && t.approval!=='pending');
   const done = mine.filter(t=>t.status==='Terminée');
   const pending = mine.filter(t=>t.status!=='Terminée');
   const late = mine.filter(t=>t.status==='En retard').length;
@@ -2254,24 +2304,134 @@ function viewMyRecap(){
     </div>
   `;
 }
-function viewTasks(){
-  refreshDerivedStatuses();
-  const mine = S.user.role==='collab' ? TASKS.filter(t=>t.assignee===S.user.id) : TASKS;
-  const groups = ['En retard','Bloquée','En cours','En pause','À faire','Terminée'];
+/* =========================== BILAN DES ACTIVITÉS DE L'ÉQUIPE (responsable/admin) ===========================
+   Remplace, pour un responsable/admin, l'ancienne vue "Actions" (viewTasks(), grille de cartes par
+   statut — une simple capture de l'interface courante) par un véritable RAPPORT structuré : période
+   filtrable (jour/semaine/mois/plage libre), regroupement au choix par collaborateur ou par
+   projet/campagne, et pour chaque activité le détail substantiel (catégorie, projet, dates, statut,
+   description, livrable attendu/produit, appréciation du responsable). Les activités encore
+   "pending" (non validées) en sont exclues — elles n'appartiennent qu'aux files d'attente de
+   validation ("Activités à valider" / plan du jour) tant qu'elles ne sont pas validées. */
+function bilanBounds(){
+  const period = S.bilanPeriod = S.bilanPeriod || 'week';
+  if(period==='custom'){
+    const from = S.bilanFrom || todayISO();
+    const to = S.bilanTo || todayISO();
+    return {from, to: to<from? from : to, label:`${fmtDate(from)} → ${fmtDate(to<from?from:to)}`};
+  }
+  return periodBounds(period);
+}
+function teamBilanScope(){
+  if(S.user.role==='admin') return USERS.filter(u=>u.role==='collab' || u.role==='manager');
+  return USERS.filter(u=>u.role==='collab' && u.departmentId===S.user.departmentId);
+}
+function bilanTaskRow(t, opts){
+  opts = opts || {};
+  const proj = t.project ? PROJECTS.find(p=>p.id===t.project) : null;
+  const app = t.appreciation;
   return `
-    <div class="flex-between" style="margin-bottom:16px;">
-      <div><div class="section-title">${S.user.role==='collab'?'Mes actions':'Toutes les actions'}</div><p class="section-sub">${mine.length} action(s) au total</p></div>
-      ${(S.user.role==='collab'||S.user.role==='manager')?`<button class="btn btn-primary btn-sm" onclick="openAddActivity()">+ Ajouter une action</button>`:''}
+  <div class="bilan-task">
+    <div class="bilan-task-head">
+      <span class="bilan-task-title">${escapeHtml(t.title)}</span>
+      ${statusPill(t.status)}
     </div>
-    <div class="grid-3">
-      ${groups.map(g=>{
-        const list = mine.filter(t=>t.status===g);
-        if(!list.length) return '';
-        return `<div class="card">
-          <div class="card-head">${statusPill(g)}<span class="sub">${list.length}</span></div>
-          <div class="card-body">${list.map(t=>renderTaskCard(t)).join('')}</div>
-        </div>`;
-      }).join('') || `<div class="empty">Aucune activité.</div>`}
+    <div class="bilan-task-meta">
+      <span>📂 ${t.category}</span>
+      <span>🚀 ${proj?escapeHtml(proj.name):'Sans projet'}</span>
+      <span>📅 Planifiée ${fmtDate(t.date)}${t.deadline?` · Échéance ${fmtDate(t.deadline)}${t.deadlineTime?' '+t.deadlineTime:''}`:''}</span>
+      <span>${priorityLabel(t.priority)}</span>
+      ${opts.showAssignee?`<span>👤 ${escapeHtml(userByIdSafe(t.assignee).name)}</span>`:''}
+    </div>
+    ${t.description?`<div class="bilan-task-desc">${escapeHtml(t.description)}</div>`:''}
+    <div class="bilan-task-foot">
+      <span><b>Livrable attendu :</b> ${t.expectedDeliverable?escapeHtml(t.expectedDeliverable):'—'}</span>
+      <span><b>Livrable(s) produit(s) :</b> ${t.deliverables && t.deliverables.length? t.deliverables.map(d=>escapeHtml(d.name)).join(', ') : '—'}</span>
+    </div>
+    ${t.status==='Bloquée' && t.blockReason?`<div class="bilan-task-app" style="color:var(--crit);">⛔ Blocage : ${escapeHtml(t.blockReason)}</div>`:''}
+    ${app?`<div class="bilan-task-app" style="color:${APPRECIATION_STYLE[app.type].color};">${APPRECIATION_STYLE[app.type].ic} ${APPRECIATION_STYLE[app.type].label} par ${escapeHtml(userByIdSafe(app.by).name)}${app.comment?` — « ${escapeHtml(app.comment)} »`:''}</div>`:''}
+  </div>`;
+}
+function bilanByCollab(team, tasks, from, to){
+  const withTasks = team.filter(u=>tasks.some(t=>t.assignee===u.id));
+  if(!withTasks.length) return `<div class="empty" style="margin-top:6px;">Aucune activité de l'équipe sur cette période.</div>`;
+  return withTasks.map(u=>{
+    const list = tasks.filter(t=>t.assignee===u.id);
+    const doneN = list.filter(t=>t.status==='Terminée').length;
+    const p = computePerformance(u.id);
+    const reports = DAY_REPORTS.filter(r=>r.user===u.id && r.day>=from && r.day<=to);
+    return `
+    <div class="bilan-section">
+      <div class="bilan-section-head">
+        <div style="display:flex; align-items:center; gap:9px;">${avatarHTML(u,32,12)}<div><b>${escapeHtml(u.name)}</b><div style="font-size:11px; color:var(--text-muted);">${escapeHtml(u.title||'')}</div></div></div>
+        <div class="bilan-section-stats">${list.length} activité(s) · ${doneN} terminée(s) · Performance ${p.score}%</div>
+      </div>
+      ${list.map(t=>bilanTaskRow(t)).join('')}
+      ${reports.length?`<div class="bilan-dayreports"><b>Bilans de journée :</b> ${reports.map(r=>`${DAY_EFFICIENCY[r.efficiency].emoji} ${fmtShort(r.day)}${r.comment?` (« ${escapeHtml(r.comment)} »)`:''}`).join(' · ')}</div>`:''}
+    </div>`;
+  }).join('');
+}
+function bilanByProject(tasks){
+  const byProj = {};
+  tasks.forEach(t=>{ const key=t.project||'_none'; (byProj[key]=byProj[key]||[]).push(t); });
+  const keys = Object.keys(byProj);
+  if(!keys.length) return `<div class="empty" style="margin-top:6px;">Aucune activité de l'équipe sur cette période.</div>`;
+  return keys.map(key=>{
+    const proj = key==='_none'?null:PROJECTS.find(p=>p.id===key);
+    const list = byProj[key];
+    const doneN = list.filter(t=>t.status==='Terminée').length;
+    return `
+    <div class="bilan-section">
+      <div class="bilan-section-head">
+        <div><b>🚀 ${proj?escapeHtml(proj.name):'Sans projet / activités générales'}</b>${proj?`<div style="font-size:11px; color:var(--text-muted);">${escapeHtml(proj.type)}</div>`:''}</div>
+        <div class="bilan-section-stats">${list.length} activité(s) · ${doneN} terminée(s)</div>
+      </div>
+      ${list.map(t=>bilanTaskRow(t,{showAssignee:true})).join('')}
+    </div>`;
+  }).join('');
+}
+function viewTeamBilan(){
+  const {from,to,label} = bilanBounds();
+  const groupBy = S.bilanGroupBy = S.bilanGroupBy || 'collab';
+  const team = teamBilanScope();
+  const teamIds = new Set(team.map(u=>u.id));
+  const tasks = TASKS.filter(t=>teamIds.has(t.assignee) && t.date>=from && t.date<=to && t.approval!=='pending');
+  const doneN = tasks.filter(t=>t.status==='Terminée').length;
+  const lateN = tasks.filter(t=>t.status==='En retard').length;
+  const dept = currentDept();
+  const periodBtn = (key,lbl)=>`<button class="btn ${S.bilanPeriod===key?'btn-primary':'btn-outline'} btn-sm" onclick="S.bilanPeriod='${key}'; render();">${lbl}</button>`;
+  const groupBtn = (key,lbl)=>`<button class="btn ${groupBy===key?'btn-primary':'btn-outline'} btn-sm" onclick="S.bilanGroupBy='${key}'; render();">${lbl}</button>`;
+  return `
+    <div id="bilanControlsWrap">
+      <div class="flex-between" style="margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+        <div><div class="section-title">Bilan des activités de l'équipe</div><p class="section-sub">Rapport détaillé, par collaborateur ou par projet — pas un simple aperçu de l'interface</p></div>
+        <button class="btn btn-ghost btn-sm" onclick="window.print()">⬇ Imprimer / PDF</button>
+      </div>
+      <div class="bilan-controls" style="display:flex; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:18px;">
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span style="font-size:11px; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:.04em;">Période</span>
+          ${periodBtn('day','Jour')}${periodBtn('week','Semaine')}${periodBtn('month','Mois')}
+          <input type="date" value="${S.bilanFrom||from}" onchange="S.bilanFrom=this.value; S.bilanPeriod='custom'; render();" style="padding:6px 8px; border:1px solid var(--border); border-radius:8px; font-size:12px;"/>
+          <span style="font-size:12px; color:var(--text-faint);">→</span>
+          <input type="date" value="${S.bilanTo||to}" onchange="S.bilanTo=this.value; S.bilanPeriod='custom'; render();" style="padding:6px 8px; border:1px solid var(--border); border-radius:8px; font-size:12px;"/>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <span style="font-size:11px; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:.04em;">Grouper par</span>
+          ${groupBtn('collab','Collaborateur')}${groupBtn('project','Projet / Campagne')}
+        </div>
+      </div>
+    </div>
+    <div id="bilanPrintArea">
+      <div class="report-doc">
+        <h2>BILAN DES ACTIVITÉS DE L'ÉQUIPE</h2>
+        <div class="rmeta">Responsable : <b>${escapeHtml(S.user.name)}</b>${dept?` · Direction : <b>${escapeHtml(dept.name)}</b>`:''} · Période : <b>${label}</b> · Généré le ${fmtDate(todayISO())}</div>
+        <div class="report-stat-row" style="margin-bottom:18px;">
+          <div class="report-stat"><b>${tasks.length}</b><span>activité(s)</span></div>
+          <div class="report-stat"><b>${doneN}</b><span>terminée(s)</span></div>
+          <div class="report-stat" style="${lateN?'color:var(--crit);':''}"><b>${lateN}</b><span>en retard</span></div>
+          <div class="report-stat"><b>${tasks.length?Math.round(doneN/tasks.length*100):0}%</b><span>taux de réalisation</span></div>
+        </div>
+        ${groupBy==='collab' ? bilanByCollab(team, tasks, from, to) : bilanByProject(tasks)}
+      </div>
     </div>
   `;
 }
@@ -3734,7 +3894,7 @@ function render(){
     if(stateDirty()) scheduleSave();
     refreshDerivedStatuses();
     renderNav();
-    document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user && S.user.role==='collab') ? 'Mes Récaps' : (PAGE_TITLES[S.view]||'');
+    document.getElementById('pageTitle').textContent = (S.view==='tasks' && S.user) ? (S.user.role==='collab' ? 'Mes Récaps' : 'Bilan de l\'équipe') : (PAGE_TITLES[S.view] || '');
     document.getElementById('clockVal').textContent = nowTime()+' · '+fmtDow(todayISO()).split(' ')[0];
     const c = document.getElementById('content');
     /* Marque le fil d'actualité comme "vu" seulement à l'ENTRÉE sur cette vue (pas à chaque
