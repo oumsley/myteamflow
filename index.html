@@ -482,6 +482,15 @@
   .msg-conv.active{ background:var(--brand-light); border-left:3px solid var(--brand); }
   .msg-thread{ display:flex; flex-direction:column; min-width:0; }
   .msg-thread-head{ display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid var(--border); }
+  .back-conv-btn{ display:none; flex-shrink:0; }
+  @media (max-width:760px){
+    .msg-shell{ grid-template-columns:1fr; height:calc(100dvh - 190px); min-height:380px; }
+    .msg-shell .msg-list{ display:block; }
+    .msg-shell .msg-thread{ display:none; }
+    .msg-shell.thread-open .msg-list{ display:none; }
+    .msg-shell.thread-open .msg-thread{ display:flex; }
+    .back-conv-btn{ display:flex; }
+  }
   .msg-body{ flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
   .msg-row{ display:flex; gap:8px; align-items:flex-end; max-width:72%; }
   .msg-row.mine{ align-self:flex-end; flex-direction:row-reverse; max-width:72%; }
@@ -834,7 +843,7 @@ let PLAN_STATUS = {};
 let PLAN_DAY = {};
 
 /* =========================== STATE =========================== */
-const S = { user:null, view:'dashboard', projectDetail:null, calMonth:new Date().getMonth(), calYear:new Date().getFullYear(), planFilterDate: todayISO(), activeConvo:null, profileUserId:null };
+const S = { user:null, view:'dashboard', projectDetail:null, calMonth:new Date().getMonth(), calYear:new Date().getFullYear(), planFilterDate: todayISO(), activeConvo:null, profileUserId:null, mobileMsgView:'list' };
 
 /* =========================== NAV =========================== */
 const NAV = {
@@ -1050,8 +1059,8 @@ function doLogin(user){
   document.getElementById('landing-screen').style.display='none';
   document.getElementById('login-screen').style.display='none';
   document.getElementById('app').classList.add('active');
-  LAST_NAV_VIEW = S.view;
-  try{ history.replaceState({tfView:S.view, tfModal:false}, '', location.href); }catch{}
+  LAST_NAV_KEY = navKeyFor();
+  try{ history.replaceState(navStateFor(), '', location.href); }catch{}
   boot();
 }
 function renderLogin(){
@@ -1113,7 +1122,7 @@ function renderNav(){
     return `<div class="nav-item ${S.view===it.v?'active':''}" data-v="${it.v}"><span class="ic">${it.ic}</span>${it.label}${badge}</div>`;
   }).join('');
   document.querySelectorAll('.nav-item').forEach(n=>{
-    n.onclick = ()=>{ S.view=n.dataset.v; S.projectDetail=null; render(); toggleSidebar(false); };
+    n.onclick = ()=>{ if(n.dataset.v==='messages' && S.view!=='messages') S.mobileMsgView='list'; S.view=n.dataset.v; S.projectDetail=null; render(); toggleSidebar(false); };
   });
   if(S.user.photo){ document.getElementById('whoAvatar').style.background = `center/cover url('${S.user.photo}')`; document.getElementById('whoAvatar').textContent=''; }
   else { document.getElementById('whoAvatar').style.background = avatarColor(S.user.id); document.getElementById('whoAvatar').textContent = initials(S.user.name); }
@@ -1144,7 +1153,7 @@ function renderBottomNav(){
     return `<div class="bn-item ${active?'active':''}" data-v="${it.v}" data-profile="${!!it.profile}"><span class="bn-ic">${it.ic}</span>${it.label}${badge}</div>`;
   }).join('');
   bn.querySelectorAll('.bn-item').forEach(n=>{
-    n.onclick = ()=>{ closeFabMenu(); if(n.dataset.profile==='true') openMyProfile(); else { S.view=n.dataset.v; S.projectDetail=null; render(); } };
+    n.onclick = ()=>{ closeFabMenu(); if(n.dataset.profile==='true') openMyProfile(); else { if(n.dataset.v==='messages' && S.view!=='messages') S.mobileMsgView='list'; S.view=n.dataset.v; S.projectDetail=null; render(); } };
   });
 }
 /* ---------------- Bouton flottant (FAB) : création rapide ---------------- */
@@ -1924,27 +1933,53 @@ function confirmNewMember(){
 function openMemberProfile(userId){
   S.view='profile'; S.profileUserId=userId; S.projectDetail=null; render();
   document.getElementById('content').scrollTop = 0;
+  if(userId===S.user.id){
+    setTimeout(()=>{ const c=document.getElementById('editProfileCard'); if(c) c.scrollIntoView({behavior:'smooth', block:'start'}); }, 150);
+  }
 }
 function openMyProfile(){ openMemberProfile(S.user.id); }
+/* Redimensionne une image chargée (évite les fichiers énormes qui ralentissent l'affichage et la synchronisation) */
+function readImageResized(file, maxDim, cb){
+  if(!file || !file.type || !file.type.startsWith('image/')){ toast('Merci de choisir un fichier image.'); return; }
+  const reader = new FileReader();
+  reader.onerror = ()=>{ toast("Impossible de lire cette image. Réessayez."); };
+  reader.onload = ()=>{
+    try{
+      const img = new Image();
+      img.onerror = ()=>{ cb(reader.result); };
+      img.onload = ()=>{
+        try{
+          let w = img.naturalWidth||img.width, h = img.naturalHeight||img.height;
+          if(!w || !h){ cb(reader.result); return; }
+          if(w>maxDim || h>maxDim){ const scale = maxDim/Math.max(w,h); w=Math.round(w*scale); h=Math.round(h*scale); }
+          const canvas = document.createElement('canvas');
+          canvas.width=w; canvas.height=h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img,0,0,w,h);
+          cb(canvas.toDataURL('image/jpeg', 0.85));
+        }catch(e){ cb(reader.result); }
+      };
+      img.src = reader.result;
+    }catch(e){ cb(reader.result); }
+  };
+  reader.readAsDataURL(file);
+}
 function handleProfilePhoto(input){
   const file = input.files[0]; if(!file) return;
-  const reader = new FileReader();
-  reader.onload = ()=>{ S.user.photo = reader.result; render(); };
-  reader.readAsDataURL(file);
+  readImageResized(file, 640, (dataUrl)=>{ S.user.photo = dataUrl; render(); toast('Photo de profil mise à jour.'); });
+  input.value='';
 }
 function handleCoverPhoto(input){
   const file = input.files[0]; if(!file) return;
-  const reader = new FileReader();
-  reader.onload = ()=>{ S.user.cover = reader.result; render(); };
-  reader.readAsDataURL(file);
+  readImageResized(file, 1400, (dataUrl)=>{ S.user.cover = dataUrl; render(); toast('Photo de couverture mise à jour.'); });
+  input.value='';
 }
 function handleDeptPhoto(input){
   const file = input.files[0]; if(!file) return;
   let dept = currentDept();
   if(!dept){ toast("Aucune direction associée à ce profil."); return; }
-  const reader = new FileReader();
-  reader.onload = ()=>{ dept.photo = reader.result; render(); };
-  reader.readAsDataURL(file);
+  readImageResized(file, 640, (dataUrl)=>{ dept.photo = dataUrl; render(); toast('Photo de la direction mise à jour.'); });
+  input.value='';
 }
 function saveDept(){
   let dept = currentDept();
@@ -1979,6 +2014,7 @@ function saveProfile(userId){
   u.quote = document.getElementById('pfQuote').value.trim();
   if(newPass && newPass.value) u.password = newPass.value;
   if(getRememberedUserId()===u.id) setRemembered(u.id);
+  S.view = (S.user.role==='collab') ? 'myday' : 'dashboard'; S.profileUserId = null;
   render(); toast(newPass && newPass.value ? 'Profil et mot de passe mis à jour.' : 'Profil mis à jour.');
 }
 function canManageUser(u){
@@ -2004,6 +2040,7 @@ function saveManagedProfile(userId){
     u.password = newPassEl.value.trim();
   }
   if(getRememberedUserId()===u.id) setRemembered(u.id);
+  S.view = 'team'; S.profileUserId = null;
   render(); toast('Profil mis à jour.');
 }
 function confirmDeleteUser(userId){
@@ -2729,7 +2766,7 @@ function viewMessages(){
     <div></div>
     <button class="btn btn-outline btn-sm" onclick="openScheduleMeeting()">📅 Programmer une réunion</button>
   </div>
-  <div class="msg-shell">
+  <div class="msg-shell ${S.mobileMsgView==='thread'?'thread-open':''}">
     <div class="msg-list">
       ${convos.map(c=>{
         const lm = lastMsg(c.id);
@@ -2746,8 +2783,9 @@ function viewMessages(){
     </div>
     <div class="msg-thread">
       <div class="msg-thread-head">
+        <button class="icon-btn back-conv-btn" title="Retour aux conversations" onclick="closeMobileThread()">←</button>
         <div class="avatar" style="background:${active.group?'var(--brand)':avatarColor(active.other)}; width:32px; height:32px; font-size:12px;">${active.group?'👥':initials(userByIdSafe(active.other).name)}</div>
-        <div style="flex:1;"><b style="font-size:13.5px;">${active.name}</b>${active.group?`<div style="font-size:11px; color:var(--text-muted);">${active.members.length} membres</div>`:'<div style="font-size:11px; color:var(--success-dark);">● en ligne</div>'}</div>
+        <div style="flex:1; min-width:0;"><b style="font-size:13.5px;">${active.name}</b>${active.group?`<div style="font-size:11px; color:var(--text-muted);">${active.members.length} membres</div>`:'<div style="font-size:11px; color:var(--success-dark);">● en ligne</div>'}</div>
         <button class="icon-btn" title="Appel audio" onclick="startCall('${active.id}', false)">📞</button>
         <button class="icon-btn" title="Appel vidéo" onclick="startCall('${active.id}', true)">🎥</button>
       </div>
@@ -2776,7 +2814,8 @@ function renderMsgBubble(m){
     </div>
   </div>`;
 }
-function openConvo(id){ S.activeConvo=id; render(); }
+function openConvo(id){ S.activeConvo=id; S.mobileMsgView='thread'; render(); }
+function closeMobileThread(){ S.mobileMsgView='list'; render(); }
 function afterRenderMessages(){ const b=document.getElementById('msgBody'); if(b) b.scrollTop = b.scrollHeight; }
 function sendMessage(){
   const inp = document.getElementById('msgText'); const val = inp.value.trim(); if(!val) return;
@@ -2785,13 +2824,19 @@ function sendMessage(){
 }
 function handleMsgFile(input){
   const file = input.files[0]; if(!file) return;
-  const isImage = file.type.startsWith('image/');
-  const reader = new FileReader();
-  reader.onload = ()=>{
-    MESSAGES.push({id:uid('m'), conv:S.activeConvo, from:S.user.id, text:'', file:{name:file.name, size:(file.size/1024).toFixed(0)+' Ko', isImage, dataUrl:reader.result}, at:SIM_NOW.toISOString()});
+  const isImage = file.type && file.type.startsWith('image/');
+  const finish = (dataUrl)=>{
+    MESSAGES.push({id:uid('m'), conv:S.activeConvo, from:S.user.id, text:'', file:{name:file.name, size:(file.size/1024).toFixed(0)+' Ko', isImage, dataUrl}, at:SIM_NOW.toISOString()});
     render(); toast('Fichier envoyé : '+file.name);
   };
-  reader.readAsDataURL(file);
+  if(isImage){
+    readImageResized(file, 1280, finish);
+  } else {
+    const reader = new FileReader();
+    reader.onerror = ()=>{ toast("Impossible d'envoyer ce fichier."); };
+    reader.onload = ()=>{ finish(reader.result); };
+    reader.readAsDataURL(file);
+  }
   input.value='';
 }
 let callTimer=null;
@@ -2864,12 +2909,12 @@ function viewFeed(){
 let pendingPostImage = null;
 function handlePostFile(input){
   const file = input.files[0]; if(!file) return;
-  const reader = new FileReader();
-  reader.onload = ()=>{
-    pendingPostImage = reader.result;
-    document.getElementById('postPreviewWrap').innerHTML = `<div style="position:relative; margin-top:10px;"><img src="${pendingPostImage}" style="max-width:100%; max-height:220px; border-radius:10px; display:block;"/><button class="x-btn" style="position:absolute; top:6px; right:6px; background:rgba(0,0,0,.55); color:#fff; border-radius:50%; width:24px; height:24px;" onclick="pendingPostImage=null; document.getElementById('postPreviewWrap').innerHTML='';">✕</button></div>`;
-  };
-  reader.readAsDataURL(file);
+  readImageResized(file, 1280, (dataUrl)=>{
+    pendingPostImage = dataUrl;
+    const wrap = document.getElementById('postPreviewWrap'); if(!wrap) return;
+    wrap.innerHTML = `<div style="position:relative; margin-top:10px;"><img src="${pendingPostImage}" style="max-width:100%; max-height:220px; border-radius:10px; display:block;"/><button class="x-btn" style="position:absolute; top:6px; right:6px; background:rgba(0,0,0,.55); color:#fff; border-radius:50%; width:24px; height:24px;" onclick="pendingPostImage=null; document.getElementById('postPreviewWrap').innerHTML='';">✕</button></div>`;
+  });
+  input.value='';
 }
 function publishPost(){
   const text = document.getElementById('postText').value.trim();
@@ -3031,46 +3076,68 @@ document.addEventListener('click', e=>{
 });
 
 /* =========================== RENDER DISPATCH =========================== */
+let RENDER_RETRY = false;
 function render(){
-  scheduleSave();
-  refreshDerivedStatuses();
-  renderNav();
-  document.getElementById('pageTitle').textContent = PAGE_TITLES[S.view]||'';
-  document.getElementById('clockVal').textContent = nowTime()+' · '+fmtDow(todayISO()).split(' ')[0];
-  const c = document.getElementById('content');
-  const map = { dashboard:viewDashboard, myday:viewMyDay, team:viewTeam, tasks:viewTasks, projects:viewProjects, objectives:viewObjectives, performance:viewPerformance, calendar:viewCalendar, notifications:viewNotifications, reports:viewReports, settings:viewSettings, messages:viewMessages, feed:viewFeed, profile:viewProfile };
-  c.innerHTML = (map[S.view]||viewDashboard)();
-  if(S.view==='reports') renderReport();
-  if(S.view==='messages') afterRenderMessages();
-  const dot = document.getElementById('notifDot');
-  dot.style.display = NOTIFICATIONS.some(n=>n.to===S.user.id && !n.read) ? 'block':'none';
-  if(!NAV_SUPPRESS_PUSH && S.user && S.view!==LAST_NAV_VIEW){
-    LAST_NAV_VIEW = S.view;
-    try{ history.pushState({tfView:S.view, tfModal:false}, '', location.href); }catch{}
+  try{
+    scheduleSave();
+    refreshDerivedStatuses();
+    renderNav();
+    document.getElementById('pageTitle').textContent = PAGE_TITLES[S.view]||'';
+    document.getElementById('clockVal').textContent = nowTime()+' · '+fmtDow(todayISO()).split(' ')[0];
+    const c = document.getElementById('content');
+    const map = { dashboard:viewDashboard, myday:viewMyDay, team:viewTeam, tasks:viewTasks, projects:viewProjects, objectives:viewObjectives, performance:viewPerformance, calendar:viewCalendar, notifications:viewNotifications, reports:viewReports, settings:viewSettings, messages:viewMessages, feed:viewFeed, profile:viewProfile };
+    c.innerHTML = (map[S.view]||viewDashboard)();
+    if(S.view==='reports') renderReport();
+    if(S.view==='messages') afterRenderMessages();
+    const dot = document.getElementById('notifDot');
+    dot.style.display = NOTIFICATIONS.some(n=>n.to===S.user.id && !n.read) ? 'block':'none';
+    RENDER_RETRY = false;
+  }catch(err){
+    console.error('Erreur de rendu :', err);
+    if(!RENDER_RETRY){
+      RENDER_RETRY = true;
+      S.view = (S.user && S.user.role==='collab') ? 'myday' : 'dashboard';
+      S.projectDetail = null; S.profileUserId = null;
+      toast("Un problème est survenu, retour à l'accueil.");
+      render();
+      return;
+    }
+    RENDER_RETRY = false;
+  }
+  const navKey = navKeyFor();
+  if(!NAV_SUPPRESS_PUSH && S.user && navKey!==LAST_NAV_KEY){
+    LAST_NAV_KEY = navKey;
+    try{ history.pushState(navStateFor(), '', location.href); }catch{}
   }
 }
 function boot(){ render(); }
 
 /* ---------------- Navigation classique : bouton retour & touche Échap ---------------- */
-let LAST_NAV_VIEW = null;
+/* On mémorise la vue ET la sous-navigation (projet ouvert, profil consulté, conversation active)
+   pour que le bouton retour annule les dernières actions de navigation sans jamais toucher aux données. */
+let LAST_NAV_KEY = null;
 let NAV_SUPPRESS_PUSH = false;
+function navKeyFor(){ return [S.view, S.projectDetail||'', S.profileUserId||'', S.activeConvo||'', S.mobileMsgView||''].join('|'); }
+function navStateFor(){ return { tfView:S.view, tfProjectDetail:S.projectDetail||null, tfProfileUserId:S.profileUserId||null, tfActiveConvo:S.activeConvo||null, tfMobileMsgView:S.mobileMsgView||'list' }; }
 function isModalOpen(){ const m = document.getElementById('modalRoot'); return !!(m && m.innerHTML.trim()); }
 window.addEventListener('popstate', (e)=>{
   if(isModalOpen()){
     closeModal();
     NAV_SUPPRESS_PUSH = true;
-    try{ history.pushState({tfView:S.view, tfModal:false}, '', location.href); }catch{}
+    try{ history.pushState(navStateFor(), '', location.href); }catch{}
     NAV_SUPPRESS_PUSH = false;
     return;
   }
   if(S.user && e.state && e.state.tfView){
-    if(e.state.tfView !== S.view){
-      S.view = e.state.tfView; S.projectDetail = null;
-      LAST_NAV_VIEW = S.view;
-      NAV_SUPPRESS_PUSH = true;
-      render();
-      NAV_SUPPRESS_PUSH = false;
-    }
+    S.view = e.state.tfView;
+    S.projectDetail = e.state.tfProjectDetail || null;
+    S.profileUserId = e.state.tfProfileUserId || null;
+    S.activeConvo = e.state.tfActiveConvo || null;
+    S.mobileMsgView = e.state.tfMobileMsgView || 'list';
+    LAST_NAV_KEY = navKeyFor();
+    NAV_SUPPRESS_PUSH = true;
+    render();
+    NAV_SUPPRESS_PUSH = false;
   }
 });
 document.addEventListener('keydown', (e)=>{
@@ -3095,6 +3162,18 @@ document.getElementById('themeBtn').onclick = ()=>{
   const cur = r.getAttribute('data-theme');
   r.setAttribute('data-theme', cur==='dark' ? 'light' : 'dark');
 };
+
+/* Filet de sécurité global : une erreur imprévue dans un gestionnaire d'événement
+   ne doit jamais laisser un écran blanc — on avertit et on tente de se replacer sur l'accueil. */
+window.addEventListener('error', (e)=>{
+  console.error('Erreur globale :', e.error||e.message);
+  if(S.user && document.getElementById('app') && document.getElementById('app').classList.contains('active')){
+    try{ toast("Un problème est survenu."); render(); }catch{}
+  }
+});
+window.addEventListener('unhandledrejection', (e)=>{
+  console.error('Promesse rejetée :', e.reason);
+});
 
 initEntry();
 </script>
