@@ -1565,9 +1565,11 @@ function viewMyDay(){
   return renderOwnDay(S.user, true);
 }
 function planBoardCard(u, status){
-  const tasks = TASKS.filter(t=>t.assignee===u.id && t.date===todayISO());
+  const day = PLAN_DAY[u.id] || todayISO();
+  const tasks = TASKS.filter(t=>t.assignee===u.id && t.date===day);
   const done = tasks.filter(t=>t.status==='Terminée').length;
   const late = tasks.filter(t=>t.status==='En retard').length;
+  const pending = tasks.filter(t=>t.approval==='pending').length;
   return `<div style="border:1px solid var(--border); border-radius:11px; padding:10px 12px; margin-bottom:10px; cursor:pointer; transition:border-color .15s;" onclick="openPlanDetail('${u.id}')" onmouseover="this.style.borderColor='var(--brand)'" onmouseout="this.style.borderColor='var(--border)'">
     <div style="display:flex; align-items:center; gap:9px;">
       ${avatarHTML(u,34,12.5)}
@@ -1575,21 +1577,28 @@ function planBoardCard(u, status){
         <div style="font-weight:600; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${u.name}${u.nickname?' · '+u.nickname:''}</div>
         <div style="font-size:11px; color:var(--text-muted);">${tasks.length} tâche(s)${status==='validé'?` · ${done} faite(s)`:''}${late?` · <span style="color:var(--crit);">${late} en retard</span>`:''}</div>
       </div>
+      ${pending?`<span class="pill pill-warn" title="Activité(s) déclarée(s) en attente de validation">⏳ ${pending} à valider</span>`:''}
       ${status==='soumis'?`<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); approvePlan('${u.id}')" title="Approuver directement">✔</button>`:''}
     </div>
   </div>`;
 }
 function openPlanDetail(userId){
   const u = userByIdSafe(userId);
-  const tasks = TASKS.filter(t=>t.assignee===u.id && t.date===todayISO());
+  const day = PLAN_DAY[u.id] || todayISO();
+  const tasks = TASKS.filter(t=>t.assignee===u.id && t.date===day);
   const status = PLAN_STATUS[u.id];
   const statusPillMap = {brouillon:'pill-muted', soumis:'pill-warn', validé:'pill-success'};
   const statusText = {brouillon:'Pas encore soumis', soumis:'Soumis — en attente', validé:'Validé — au travail'};
+  /* On réutilise renderTaskCard() (LA seule fonction de rendu de carte-activité de l'appli) pour que
+     ce drill-down "journée d'un collaborateur" affiche exactement les mêmes pastilles d'approbation et
+     les mêmes boutons Approuver/Rejeter que partout ailleurs (Notifications, Toutes les actions, Ma
+     journée, détail de tâche) — au lieu d'une liste ad-hoc qui, avant ce correctif, n'affichait qu'un
+     simple statut sans jamais donner au responsable le moyen de valider une activité déclarée par le
+     collaborateur depuis cet écran-là. */
   openModal(`<div class="modal-head">${avatarHTML(u,34,12.5)}<h3 style="margin-left:4px;">${u.name}</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="flex-between" style="margin-bottom:12px;"><span style="font-size:12.5px; color:var(--text-muted);">${u.title}</span><span class="pill ${statusPillMap[status]}">${statusText[status]}</span></div>
-    ${tasks.length? tasks.map(t=>`<div style="display:flex; justify-content:space-between; gap:8px; padding:8px 0; border-bottom:1px solid var(--border); font-size:12.5px;">
-      <span>${t.title} <span style="color:var(--text-faint);">· ${priorityLabel(t.priority)}</span></span>${statusPill(t.status)}</div>`).join('') : `<div class="empty">Aucune activité planifiée.</div>`}
+    ${tasks.length? tasks.map(t=>renderTaskCard(t)).join('') : `<div class="empty">Aucune activité planifiée.</div>`}
   </div>
   <div class="modal-foot">
     <button class="btn btn-outline btn-sm" onclick="closeModal(); openAssignModal('${u.id}');">+ Assigner une tâche</button>
@@ -1599,6 +1608,13 @@ function openPlanDetail(userId){
 }
 function approvePlan(uid){
   PLAN_STATUS[uid]='validé';
+  const day = PLAN_DAY[uid] || todayISO();
+  /* Approuver le plan du jour vaut approbation de toutes les activités qu'il contient : on nettoie
+     ici toute activité de ce jour restée à l'état "pending" (notamment celles créées pendant la
+     construction du brouillon, y compris via d'anciennes données déjà en base avant ce correctif)
+     pour qu'elle n'apparaisse plus indéfiniment dans "Actions à valider" alors que le responsable
+     vient précisément de valider l'ensemble du plan qui la contient. */
+  TASKS.filter(t=>t.assignee===uid && t.date===day && t.approval==='pending').forEach(t=>{ t.approval='approved'; });
   NOTIFICATIONS.unshift({id:uid+'_valid_'+Date.now(), type:'validation', text:'Votre plan du jour a été validé.', to:uid, from:S.user.id, at:SIM_NOW.toISOString(), read:false});
   toast(userByIdSafe(uid).name+' : plan validé — la journée peut démarrer.'); render();
 }
@@ -1729,6 +1745,19 @@ function lateLabel(t){
   if(mins<1440) return `${Math.floor(mins/60)} h${mins%60?(mins%60)+'min':''}`;
   return `${Math.floor(mins/1440)} jour(s)`;
 }
+/* =========================== APPROBATION — RÈGLE UNIQUE =========================== */
+/* Seule fonction qui décide si LE VIEWER COURANT peut approuver/rejeter une activité donnée.
+   Utilisée PARTOUT (renderTaskCard, openTaskDetail, pendingApprovalTasks) afin qu'aucune vue
+   ne puisse diverger des autres sur qui a le droit de valider quoi : un admin peut valider
+   n'importe quelle activité en attente ; un responsable seulement celles de son propre
+   département, et jamais les siennes propres (auto-validation interdite). */
+function canApproveTask(t){
+  if(!t || t.approval!=='pending' || !S.user) return false;
+  if(S.user.role==='admin') return true;
+  if(S.user.role!=='manager') return false;
+  if(t.assignee===S.user.id) return false;
+  return userByIdSafe(t.assignee).departmentId===S.user.departmentId;
+}
 function renderTaskCard(t){
   const proj = t.project ? PROJECTS.find(p=>p.id===t.project) : null;
   const lateLbl = t.status==='En retard' ? lateLabel(t) : '';
@@ -1744,7 +1773,7 @@ function renderTaskCard(t){
     if(t.status==='En pause') actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Reprendre</button>`;
     if(t.status==='Bloquée') actions += `<button class="btn btn-primary btn-sm" onclick="setTaskStatus('${t.id}','En cours')">▶ Débloquer</button>`;
   }
-  if(t.approval==='pending' && (S.user.role==='manager' || S.user.role==='admin')){
+  if(canApproveTask(t)){
     actions += `<button class="btn btn-primary btn-sm" onclick="approveActivity('${t.id}')">✅ Approuver</button><button class="btn btn-danger btn-sm" onclick="rejectActivity('${t.id}')">🚫 Rejeter</button>`;
   }
   return `
@@ -1834,12 +1863,26 @@ function confirmAddActivity(){
   const proj = PROJECTS.find(p=>p.id===projId);
   const day = PLAN_DAY[S.user.id] || todayISO();
   const newId = uid('t');
+  /* Une activité ajoutée PENDANT la construction du plan (statut encore "brouillon") fait partie
+     du plan qui sera soumis puis validé EN BLOC par le responsable via approvePlan() -- elle n'a
+     donc pas besoin d'une validation individuelle en plus. Seule une activité ajoutée APRÈS que
+     le plan du jour est déjà "validé" (le collaborateur est en train de travailler et déclare une
+     nouvelle action en cours de journée) doit transiter par le circuit d'approbation individuelle
+     (pastille "À valider" + approveActivity/rejectActivity). Avant ce correctif, confirmAddActivity
+     marquait TOUJOURS approval:'pending', y compris pour un simple ajout au brouillon -- ce qui
+     laissait ces tâches indéfiniment "en attente" aux yeux du responsable même après validation du
+     plan entier, polluant "Actions à valider" avec des activités déjà couvertes par ailleurs. */
+  const needsIndividualApproval = S.user.role==='collab' && PLAN_STATUS[S.user.id]==='validé';
   TASKS.push({id:newId, title, description:document.getElementById('naDesc').value.trim(), category:document.getElementById('naCat').value, priority:document.getElementById('naPrio').value,
     assignee:S.user.id, project:projId, phase:proj.currentPhase, duration:document.getElementById('naDur').value||'1h',
     date:day, deadline:day, deadlineTime:document.getElementById('naDeadlineTime').value||WORK_END, status:'À faire', deliverables:[], comments:[],
-    expectedDeliverable:document.getElementById('naDeliv').value, approval:'pending'});
-  notifyManagers({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
-  closeModal(); render(); toast('Activité ajoutée à votre plan — en attente de validation par votre responsable.');
+    expectedDeliverable:document.getElementById('naDeliv').value, approval: needsIndividualApproval ? 'pending' : null});
+  if(needsIndividualApproval){
+    notifyManagers({type:'a_valider', text:`${S.user.name} a ajouté une activité à valider : « ${title} » (${proj.name}).`, taskId:newId});
+    closeModal(); render(); toast('Activité ajoutée à votre plan — en attente de validation par votre responsable.');
+  } else {
+    closeModal(); render(); toast('Activité ajoutée à votre plan.');
+  }
 }
 function submitPlan(){
   PLAN_STATUS[S.user.id]='soumis';
@@ -1961,7 +2004,7 @@ function openTaskDetail(id){
   const t = TASKS.find(x=>x.id===id);
   const proj = t.project? PROJECTS.find(p=>p.id===t.project):null;
   const canAppreciate = (S.user.role==='manager'||S.user.role==='admin') && t.status==='Terminée';
-  const canApprove = (S.user.role==='manager'||S.user.role==='admin') && t.approval==='pending';
+  const canApprove = canApproveTask(t);
   openModal(`<div class="modal-head"><h3>${t.title}</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
   <div class="modal-body">
     <div class="task-meta" style="margin-bottom:12px;">${statusPill(t.status)}<span class="pill pill-muted">${t.category}</span><span>${priorityLabel(t.priority)}</span>${proj?`<span class="pill pill-accent">🚀 ${proj.name}</span>`:''}${t.approval==='pending'?'<span class="pill pill-warn">⏳ À valider</span>':t.approval==='approved'?'<span class="pill pill-success">✅ Validée</span>':t.approval==='rejected'?'<span class="pill pill-crit">🚫 Rejetée</span>':''}</div>
@@ -2003,7 +2046,7 @@ function addComment(id){
 }
 /* =========================== VALIDATION DES ACTIVITÉS AUTO-DÉCLARÉES =========================== */
 function pendingApprovalTasks(){
-  return TASKS.filter(t=>t.approval==='pending' && (S.user.role==='admin' || userByIdSafe(t.assignee).departmentId===S.user.departmentId));
+  return TASKS.filter(t=>canApproveTask(t));
 }
 function approveActivity(id){
   const t = TASKS.find(x=>x.id===id); if(!t) return;
@@ -2594,7 +2637,7 @@ function projectDetailView(id){
                 <b>${ph}</b>${isCurrent?'<span class="pill pill-brand">En cours</span>':''}
                 <div style="flex:1;"></div><span class="mono" style="font-size:12px;">${phProg}%</span>
               </div>
-              ${pt.length?`<div class="table-wrap"><table><tbody>${pt.map(t=>`<tr><td style="width:50%;">${t.title}</td><td>${userByIdSafe(t.assignee).name}</td><td>${statusPill(t.status)}</td></tr>`).join('')}</tbody></table></div>`:`<div style="padding:12px 16px; font-size:12px; color:var(--text-faint);">Aucune tâche associée.</div>`}
+              ${pt.length?`<div class="table-wrap"><table><tbody>${pt.map(t=>`<tr style="cursor:pointer;" onclick="openTaskDetail('${t.id}')"><td style="width:50%;">${t.title}${canApproveTask(t)?' <span class=\"pill pill-warn\" style=\"margin-left:4px;\">⏳ À valider</span>':t.approval==='rejected'?' <span class=\"pill pill-crit\" style=\"margin-left:4px;\">🚫 Rejetée</span>':''}</td><td>${userByIdSafe(t.assignee).name}</td><td>${statusPill(t.status)}</td></tr>`).join('')}</tbody></table></div>`:`<div style="padding:12px 16px; font-size:12px; color:var(--text-faint);">Aucune tâche associée.</div>`}
             </div>`;
           }).join('')}
         </div>
