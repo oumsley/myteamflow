@@ -1077,11 +1077,24 @@ function mergeArraysById(localArr, remoteArr, lastArr, tombstones, arrayKey){
 }
 /* Même logique que mergeArraysById mais pour les objets "dictionnaire" indexés par clé (id
    utilisateur, etc.) comme PLAN_STATUS, MSG_READ, FEED_SEEN, ou l'objet WEIGHTS lui-même (dont les
-   "clés" sont les catégories de pondération). */
-function mergeKeyedObject(localObj, remoteObj, lastObj){
+   "clés" sont les catégories de pondération).
+   `tombstones`/`objKey` (optionnels) permettent -- comme pour mergeArraysById -- de faire respecter
+   la SUPPRESSION d'une clé (ex. deleteUserCore() qui fait `delete PLAN_STATUS[userId]`) et pas
+   seulement la modification de sa valeur. SANS ÇA, une clé supprimée localement mais encore
+   présente côté distant réapparaissait TOUJOURS après fusion : la boucle ci-dessous ne parcourt
+   que les clés encore présentes dans localObj, donc une clé absente localement ne pouvait jamais
+   être considérée comme "modifiée localement" -- `merged` (qui part d'une copie de remoteObj)
+   gardait alors indéfiniment l'ancienne valeur distante. Constaté en production : un responsable
+   ou collaborateur supprimé (bien retiré de USERS grâce aux tombstones) réapparaissait quand même
+   pour toujours dans PLAN_STATUS/PLAN_DAY avec son dernier statut ("soumis", etc.), polluant les
+   écrans de validation de plans. */
+function mergeKeyedObject(localObj, remoteObj, lastObj, tombstones, objKey){
   localObj = localObj||{}; remoteObj = remoteObj||{}; lastObj = lastObj||{};
+  const isTombstoned = (k) => !!(tombstones && objKey && Object.prototype.hasOwnProperty.call(tombstones, objKey+'::'+k));
   const merged = Object.assign({}, remoteObj);
+  Object.keys(merged).forEach(k=>{ if(isTombstoned(k)) delete merged[k]; });
   Object.keys(localObj).forEach(k=>{
+    if(isTombstoned(k)) return;
     const wasKnown = Object.prototype.hasOwnProperty.call(lastObj, k);
     const unchangedLocally = wasKnown && _stableJSON(lastObj[k])===_stableJSON(localObj[k]);
     if(unchangedLocally){
@@ -1155,7 +1168,7 @@ async function mergeAndSave(attempt){
          pour ne pas laisser réapparaître un élément supprimé (localement ou par un autre client). */
       merged.TOMBSTONES = mergeKeyedObject(local.TOMBSTONES, remoteState.data.TOMBSTONES, last && last.TOMBSTONES);
       SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = mergeArraysById(local[k], remoteState.data[k], last && last[k], merged.TOMBSTONES, k); });
-      SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = mergeKeyedObject(local[k], remoteState.data[k], last && last[k]); });
+      SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = mergeKeyedObject(local[k], remoteState.data[k], last && last[k], merged.TOMBSTONES, k); });
     } else {
       /* Pas d'état distant exploitable : on copie (au lieu de réutiliser la même référence)
          pour qu'applyState() -- qui mute les tableaux "in place" -- ne vide pas nos propres
@@ -2690,8 +2703,14 @@ function deleteUserCore(userId){
   TASKS = TASKS.filter(t=>t.assignee!==userId);
   NOTIFICATIONS.filter(n=>n.to===userId).forEach(n=>tombstone('NOTIFICATIONS', n.id));
   NOTIFICATIONS = NOTIFICATIONS.filter(n=>n.to!==userId);
-  delete PLAN_STATUS[userId];
-  delete PLAN_DAY[userId];
+  /* Tombstoner CES clés (en plus de les supprimer localement) est indispensable : PLAN_STATUS,
+     PLAN_DAY et DAY_STARTED sont des objets "dictionnaire" fusionnés par mergeKeyedObject, qui --
+     sans un tombstone -- ne peut pas distinguer "clé supprimée délibérément" de "clé jamais
+     touchée par ce navigateur", et laisse alors l'ancienne valeur distante réapparaître à la
+     prochaine synchronisation (voir le commentaire de mergeKeyedObject). */
+  tombstone('PLAN_STATUS', userId); delete PLAN_STATUS[userId];
+  tombstone('PLAN_DAY', userId); delete PLAN_DAY[userId];
+  tombstone('DAY_STARTED', userId); delete DAY_STARTED[userId];
   OBJECTIVES.filter(o=>o.owner===userId).forEach(o=>tombstone('OBJECTIVES', o.id));
   OBJECTIVES = OBJECTIVES.filter(o=>o.owner!==userId);
   PROJECTS.forEach(p=>{ p.members = p.members.filter(m=>m!==userId); if(p.manager===userId) p.manager=null; });
@@ -2708,7 +2727,7 @@ function deleteUserCore(userId){
     Object.keys(MSG_READ).forEach(k=>{ if(k.startsWith(userId+'::')) delete MSG_READ[k]; });
   }
   if(typeof FEED_SEEN!=='undefined'){
-    delete FEED_SEEN[userId];
+    tombstone('FEED_SEEN', userId); delete FEED_SEEN[userId];
   }
   const idx = USERS.findIndex(x=>x.id===userId);
   if(idx>-1){ tombstone('USERS', userId); USERS.splice(idx,1); }
