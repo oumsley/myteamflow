@@ -819,6 +819,14 @@ let OBJECTIVES = [];
 
 /* ---------------- Performance ---------------- */
 let WEIGHTS = {realisation:30, delais:20, qualite:20, objectifs:20, initiative:10};
+/* Registre des suppressions ("tombstones") : clé "NOM_TABLEAU::id" -> horodatage de suppression.
+   Indispensable pour que la fusion de synchronisation (mergeArraysById) sache qu'un id retiré
+   localement doit rester absent, au lieu de le voir réapparaître depuis la copie distante (qui,
+   au moment de la fusion, n'a pas encore forcément connaissance de cette suppression). Sans ça,
+   toute suppression (utilisateur, tâche, projet, notification, etc.) pouvait être silencieusement
+   annulée par le tout premier cycle de synchronisation qui suit la suppression. */
+let TOMBSTONES = {};
+function tombstone(key, id){ if(id!=null) TOMBSTONES[key+'::'+id] = Date.now(); }
 function computePerformance(userId){
   const t = TASKS.filter(x=>x.assignee===userId);
   const planned = t.length || 1;
@@ -1008,6 +1016,7 @@ function collectState(){
   return {
     USERS, DEPARTMENTS, PROJECTS, TASKS, OBJECTIVES, WEIGHTS, NOTIFICATIONS,
     PLAN_STATUS, PLAN_DAY, MESSAGES, MSG_READ, FEED_SEEN, MEETINGS, POSTS, DAY_REPORTS, DAY_STARTED,
+    TOMBSTONES,
   };
 }
 function applyState(data){
@@ -1029,6 +1038,7 @@ function applyState(data){
   if(Array.isArray(data.POSTS)) POSTS = data.POSTS;
   if(Array.isArray(data.DAY_REPORTS)) setArr(DAY_REPORTS, data.DAY_REPORTS);
   if(data.DAY_STARTED) DAY_STARTED = data.DAY_STARTED;
+  if(data.TOMBSTONES) TOMBSTONES = data.TOMBSTONES;
 }
 /* Fusionne deux tableaux d'objets {id,...} : on garde toute entrée distante absente en local
    (insérée par un autre navigateur pendant que le nôtre était hors ligne / avait un modal ouvert),
@@ -1040,14 +1050,21 @@ function applyState(data){
    sauvegarde pour une tout autre raison n'écrase silencieusement la modification de quelqu'un d'autre
    sur un enregistrement qu'il n'a lui-même jamais touché (ex. un collaborateur qui ajoute une tâche
    pendant que son responsable renomme un projet). */
-function mergeArraysById(localArr, remoteArr, lastArr){
+function mergeArraysById(localArr, remoteArr, lastArr, tombstones, arrayKey){
   const remoteMap = new Map();
   (Array.isArray(remoteArr)?remoteArr:[]).forEach(item=>{ if(item && item.id!=null) remoteMap.set(item.id, item); });
   const lastMap = new Map();
   (Array.isArray(lastArr)?lastArr:[]).forEach(item=>{ if(item && item.id!=null) lastMap.set(item.id, item); });
-  const merged = new Map(remoteMap);
+  /* Un id "tombstoné" (supprimé délibérément par un client, local ou distant) doit rester absent
+     du résultat fusionné même s'il est encore présent côté distant (qui n'a pas forcément eu le
+     temps de recevoir la suppression) -- sinon la fusion "union" ci-dessous ferait réapparaître
+     tout élément supprimé dès le premier cycle de synchronisation qui suit sa suppression. */
+  const isTombstoned = (id) => !!(tombstones && arrayKey && Object.prototype.hasOwnProperty.call(tombstones, arrayKey+'::'+id));
+  const merged = new Map();
+  remoteMap.forEach((item, id)=>{ if(!isTombstoned(id)) merged.set(id, item); });
   (Array.isArray(localArr)?localArr:[]).forEach(item=>{
     if(!item || item.id==null) return;
+    if(isTombstoned(item.id)) return;
     if(remoteMap.has(item.id)){
       const lastItem = lastMap.get(item.id);
       const unchangedLocally = lastMap.has(item.id) && _stableJSON(lastItem)===_stableJSON(item);
@@ -1134,13 +1151,20 @@ async function mergeAndSave(attempt){
     const merged = {};
     if(remoteState && remoteState.data){
       const last = _lastSyncedSnapshot;
-      SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = mergeArraysById(local[k], remoteState.data[k], last && last[k]); });
+      /* Fusionner le registre des suppressions AVANT les tableaux : mergeArraysById en a besoin
+         pour ne pas laisser réapparaître un élément supprimé (localement ou par un autre client). */
+      merged.TOMBSTONES = mergeKeyedObject(local.TOMBSTONES, remoteState.data.TOMBSTONES, last && last.TOMBSTONES);
+      SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = mergeArraysById(local[k], remoteState.data[k], last && last[k], merged.TOMBSTONES, k); });
       SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = mergeKeyedObject(local[k], remoteState.data[k], last && last[k]); });
     } else {
       /* Pas d'état distant exploitable : on copie (au lieu de réutiliser la même référence)
          pour qu'applyState() -- qui mute les tableaux "in place" -- ne vide pas nos propres
          tableaux globaux avant de les avoir sauvegardés. */
-      SYNC_ARRAY_KEYS.forEach(k=>{ merged[k] = Array.isArray(local[k]) ? local[k].slice() : local[k]; });
+      merged.TOMBSTONES = Object.assign({}, local.TOMBSTONES);
+      SYNC_ARRAY_KEYS.forEach(k=>{
+        const arr = Array.isArray(local[k]) ? local[k].slice() : local[k];
+        merged[k] = Array.isArray(arr) ? arr.filter(item=> !(item && item.id!=null && Object.prototype.hasOwnProperty.call(merged.TOMBSTONES, k+'::'+item.id))) : arr;
+      });
       SYNC_OBJECT_KEYS.forEach(k=>{ merged[k] = Object.assign({}, local[k]); });
     }
     applyState(merged);
@@ -1829,7 +1853,7 @@ function renderOwnDay(u, full){
   </div>`:''}
   `;
 }
-function removeDraftTask(id){ TASKS = TASKS.filter(t=>t.id!==id); render(); }
+function removeDraftTask(id){ tombstone('TASKS', id); TASKS = TASKS.filter(t=>t.id!==id); render(); }
 function withdrawPlan(){ PLAN_STATUS[S.user.id]='brouillon'; render(); toast('Plan retiré — modifiable à nouveau.'); }
 
 function lateLabel(t){
@@ -2653,17 +2677,22 @@ function confirmDeleteUser(userId){
   if(u.role==='manager'){
     const dept = deptForUser(u);
     const teamCount = dept ? USERS.filter(x=>x.role==='collab' && x.departmentId===dept.id).length : 0;
-    warning = `${u.name} est responsable de la direction « ${dept?dept.name:'—'} ». Supprimer ce compte supprimera aussi cette direction et ${teamCount} collaborateur(s) associé(s). Cette action est irréversible.`;
+    warning = teamCount>0
+      ? `${u.name} est responsable de la direction « ${dept?dept.name:'—'} », qui compte ${teamCount} collaborateur(s). Ce compte responsable sera supprimé et ${teamCount} collaborateur(s) seront conservés mais n'auront plus de responsable assigné (leur rattachement à la direction, leurs tâches et leur historique restent intacts). Vous pourrez leur assigner un nouveau responsable ultérieurement. Confirmer la suppression ?`
+      : `${u.name} est responsable de la direction « ${dept?dept.name:'—'} ». Cette action est irréversible.`;
   }
   openModal(`<div class="modal-head"><h3>Supprimer ce profil</h3><button class="x-btn" onclick="closeModal()">✕</button></div>
   <div class="modal-body"><p style="font-size:13.5px; color:var(--text-muted);">${warning}</p></div>
   <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Annuler</button><button class="btn btn-danger" onclick="deleteUser('${userId}')">Supprimer définitivement</button></div>`);
 }
 function deleteUserCore(userId){
+  TASKS.filter(t=>t.assignee===userId).forEach(t=>tombstone('TASKS', t.id));
   TASKS = TASKS.filter(t=>t.assignee!==userId);
+  NOTIFICATIONS.filter(n=>n.to===userId).forEach(n=>tombstone('NOTIFICATIONS', n.id));
   NOTIFICATIONS = NOTIFICATIONS.filter(n=>n.to!==userId);
   delete PLAN_STATUS[userId];
   delete PLAN_DAY[userId];
+  OBJECTIVES.filter(o=>o.owner===userId).forEach(o=>tombstone('OBJECTIVES', o.id));
   OBJECTIVES = OBJECTIVES.filter(o=>o.owner!==userId);
   PROJECTS.forEach(p=>{ p.members = p.members.filter(m=>m!==userId); if(p.manager===userId) p.manager=null; });
   if(typeof POSTS!=='undefined'){
@@ -2682,23 +2711,33 @@ function deleteUserCore(userId){
     delete FEED_SEEN[userId];
   }
   const idx = USERS.findIndex(x=>x.id===userId);
-  if(idx>-1) USERS.splice(idx,1);
+  if(idx>-1){ tombstone('USERS', userId); USERS.splice(idx,1); }
 }
 function deleteUser(userId){
   const u = userByIdSafe(userId);
   if(!u || !canManageUser(u)){ toast("Vous n'avez pas le droit de supprimer ce profil."); return; }
+  let detachedCount = 0;
   if(u.role==='manager'){
+    /* Un responsable supprimé ne doit PAS entraîner la suppression de ses collaborateurs : on les
+       détache proprement (plus de responsable assigné à leur direction) au lieu de les effacer.
+       Leurs tâches, historique et rattachement à la direction restent intacts -- ils pourront
+       continuer à se connecter et travailler normalement, et un nouveau responsable pourra leur
+       être assigné plus tard. */
     const dept = deptForUser(u);
     if(dept){
-      USERS.filter(x=>x.role==='collab' && x.departmentId===dept.id).map(x=>x.id).forEach(id=>deleteUserCore(id));
-      const di = DEPARTMENTS.findIndex(d=>d.id===dept.id);
-      if(di>-1) DEPARTMENTS.splice(di,1);
+      detachedCount = USERS.filter(x=>x.role==='collab' && x.departmentId===dept.id).length;
+      dept.managerId = null;
     }
+    const general = PROJECTS.find(p=>p.id==='p_general');
+    if(general && general.manager===userId) general.manager = null;
   }
   deleteUserCore(userId);
   closeModal();
   S.view = 'team'; S.profileUserId = null;
-  render(); toast('Profil supprimé.');
+  render();
+  toast(detachedCount>0
+    ? `Profil supprimé. ${detachedCount} collaborateur(s) restent rattaché(s) à la direction, sans responsable assigné pour le moment.`
+    : 'Profil supprimé.');
 }
 /* =========================== PROFILE (page de présentation) =========================== */
 function viewProfile(){
@@ -3073,7 +3112,7 @@ function deleteProjectById(id){
   if(!p || !canManageProject(p) || p.id==='p_general'){ toast("Vous n'avez pas le droit de supprimer ce projet."); return; }
   TASKS.forEach(t=>{ if(t.project===id) t.project=null; });
   const idx = PROJECTS.findIndex(x=>x.id===id);
-  if(idx>-1) PROJECTS.splice(idx,1);
+  if(idx>-1){ tombstone('PROJECTS', id); PROJECTS.splice(idx,1); }
   closeModal();
   S.projectDetail=null;
   render(); toast('Projet supprimé.');
@@ -3776,6 +3815,7 @@ function deletePost(id){
   <div class="modal-foot"><button class="btn btn-outline" onclick="closeModal()">Annuler</button><button class="btn btn-danger" onclick="confirmDeletePost('${id}')">Supprimer</button></div>`);
 }
 function confirmDeletePost(id){
+  tombstone('POSTS', id);
   POSTS = POSTS.filter(x=>x.id!==id);
   POSTS.forEach(p=>{ if(p.sharedFrom===id) p.sharedFrom=null; });
   closeModal(); render(); toast('Publication supprimée.');
