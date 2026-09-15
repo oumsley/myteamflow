@@ -1706,8 +1706,28 @@ function approvePlan(uid){
 
 /* Vrai si CE collaborateur a déjà cliqué "Démarrer ma journée" pour la journée en cours
    (PLAN_DAY[u.id]). Tant que ce n'est pas le cas, il ne doit avoir accès à aucune création
-   d'activité — voir startMyDay() et le garde-fou dans confirmAddActivity(). */
-function dayStarted(u){ return DAY_STARTED[u.id] === (PLAN_DAY[u.id] || todayISO()); }
+   d'activité — voir startMyDay() et le garde-fou dans confirmAddActivity().
+   CORRECTIF (bug production « impossible de créer plusieurs activités ») : dès que le plan du
+   jour est "soumis" ou "validé", la journée est FORCÉMENT déjà démarrée -- on ne peut pas
+   atteindre ces statuts sans être passé par startMyDay() au préalable. renderOwnDay() le savait
+   déjà et contournait le garde-fou pour ces deux statuts (voir son "Étape 0"), mais
+   openAddActivity()/confirmAddActivity() appelaient dayStarted() seul, sans ce même contournement
+   -- une stricte égalité DAY_STARTED[u.id]===PLAN_DAY[u.id]. Toute désynchronisation de
+   DAY_STARTED (ex. compte dont le statut "validé" existait déjà avant l'introduction de ce champ,
+   ou tout autre cas où la clé s'est perdue alors que PLAN_STATUS/PLAN_DAY sont restés intacts)
+   laissait alors le bouton "+ Ajouter une activité" visible (car le rendu, lui, ne bloquait pas)
+   mais totalement inopérant au clic : le collaborateur ne pouvait plus jamais soumettre de
+   nouvelle activité de la journée, silencieusement, sans aucun message explicite du pourquoi.
+   dayStarted() est LA seule fonction utilisée par tous les points d'entrée de création
+   d'activité (bouton, FAB, garde-fou serveur) : la faire correspondre exactement à la même
+   condition que renderOwnDay() élimine la divergence pour TOUS les collaborateurs, y compris
+   ceux dont l'état était déjà désynchronisé avant ce correctif (pas besoin de migration de
+   données : la condition se recalcule à chaque appel). */
+function dayStarted(u){
+  if(DAY_STARTED[u.id] === (PLAN_DAY[u.id] || todayISO())) return true;
+  const status = PLAN_STATUS[u.id];
+  return status==='soumis' || status==='validé';
+}
 function canStartDayNow(){ return nowTime() >= WORK_START; }
 function startMyDay(){
   if(!canStartDayNow()){ toast(`Ta journée démarre à ${WORK_START}.`); return; }
@@ -2009,6 +2029,13 @@ function confirmAddActivity(){
   const projId = document.getElementById('naProj').value;
   const proj = PROJECTS.find(p=>p.id===projId);
   const day = PLAN_DAY[S.user.id] || todayISO();
+  /* Auto-réparation : si on est arrivé ici grâce au contournement "soumis/validé" de dayStarted()
+     plutôt que via une correspondance stricte DAY_STARTED[u]===PLAN_DAY[u] (compte dont l'état
+     était désynchronisé -- voir le commentaire de dayStarted()), on normalise DAY_STARTED
+     immédiatement pour que ce collaborateur ne dépende plus jamais de ce contournement à l'avenir
+     et que toute autre vue lisant DAY_STARTED directement (plutôt que via dayStarted()) reste
+     cohérente elle aussi. */
+  if(S.user.role==='collab' && DAY_STARTED[S.user.id]!==day) DAY_STARTED[S.user.id] = day;
   const newId = uid('t');
   /* Une activité ajoutée PENDANT la construction du plan (statut encore "brouillon") fait partie
      du plan qui sera soumis puis validé EN BLOC par le responsable via approvePlan() -- elle n'a
