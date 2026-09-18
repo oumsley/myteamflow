@@ -762,7 +762,16 @@ function isWeekend(iso){ const d=new Date(iso+'T00:00:00').getDay(); return d===
 function nextWorkday(iso){
   let d = new Date(iso+'T00:00:00');
   do{ d.setDate(d.getDate()+1); } while(d.getDay()===0 || d.getDay()===6);
-  return d.toISOString().slice(0,10);
+  /* CORRECTIF (dates antérieures) : d.toISOString() convertit en UTC, alors que `d` a été construit
+     et incrémenté en heure LOCALE (comme todayISO()/addDays() partout ailleurs dans le fichier).
+     Dans tout fuseau horaire en avance sur UTC (la quasi-totalité de l'Afrique/Europe/Asie), minuit
+     local correspond à la veille en UTC -- toISOString().slice(0,10) renvoyait donc silencieusement
+     la date de la veille au lieu du jour ouvré suivant. confirmCloseDay() écrit ce résultat dans
+     PLAN_DAY[user] ET dans le `date`/`deadline` des tâches reportées : une date UTC en retard d'un
+     jour se propageait alors directement dans les activités (nouvelles et reportées) datées d'un
+     jour antérieur au bon jour ouvré. On reconstruit la chaîne ISO à partir des composantes locales,
+     exactement comme todayISO(), pour rester cohérent quel que soit le fuseau horaire du poste. */
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
 function fmtDow(iso){ return new Date(iso+'T00:00:00').toLocaleDateString('fr-FR',{weekday:'long', day:'2-digit', month:'long'}); }
 /* Horloge simulée du prototype — permet de démontrer les échéances intra-journée */
@@ -991,7 +1000,21 @@ function getRememberedUserId(){
   try{ const raw = localStorage.getItem(REMEMBER_KEY); if(!raw) return null; const data = JSON.parse(raw); return data && data.userId || null; }
   catch{ return null; }
 }
-function getRememberedUser(){ const id = getRememberedUserId(); return id ? (userByIdSafe(id)||null) : null; }
+/* CORRECTIF (bug production « les collaborateurs n'arrivent pas à démarrer leur journée ») :
+   cette fonction utilisait userByIdSafe(id), qui renvoie DELETED_USER_PLACEHOLDER (id littéral
+   "__deleted__") dès que l'utilisateur mémorisé n'est PAS trouvé dans USERS -- ce qui n'arrive pas
+   seulement quand ce compte a été réellement supprimé, mais aussi (bien plus souvent) quand USERS
+   n'est pas encore à jour au moment de l'auto-connexion (ex. chargement initial distant lent/en
+   échec -- voir initEntry() qui republie même les données de démo si loadStateRemote() échoue).
+   initEntry() appelait alors doLogin() avec ce placeholder : le collaborateur se retrouvait
+   connecté en tant que faux compte "Utilisateur supprimé" (role collab, sans département, sans
+   nom) PARTAGÉ par tout le monde dans ce cas. Toute action "Démarrer ma journée"/création
+   d'activité écrivait alors DAY_STARTED/PLAN_STATUS/PLAN_DAY sous la clé "__deleted__" au lieu de
+   son vrai id -- constaté tel quel en production -- et son VRAI compte ne voyait donc jamais sa
+   journée démarrer, indéfiniment, à chaque nouvelle tentative. On utilise ici userById() (sans
+   filet) : si le compte mémorisé est introuvable, on renvoie null pour laisser initEntry()
+   retomber sur l'écran de connexion normal plutôt que de fabriquer une fausse session. */
+function getRememberedUser(){ const id = getRememberedUserId(); return id ? (userById(id)||null) : null; }
 function setRemembered(userId){ try{ localStorage.setItem(REMEMBER_KEY, JSON.stringify({userId})); }catch{} }
 function clearRemembered(){ try{ localStorage.removeItem(REMEMBER_KEY); }catch{} }
 
@@ -1287,6 +1310,10 @@ function showLoginScreen(){
 function goToLogin(){ showLoginScreen(); }
 
 function doLogin(user){
+  /* Garde-fou supplémentaire : ne jamais ouvrir de session sur le placeholder "compte supprimé"
+     (voir le correctif de getRememberedUser()) -- si un appelant le passe quand même par erreur,
+     on retombe proprement sur l'écran de connexion plutôt que de créer une session fantôme. */
+  if(!user || user.id===DELETED_USER_PLACEHOLDER.id){ clearRemembered(); showLoginScreen(); return; }
   S.user = user;
   S.view = (user.role==='collab') ? 'myday' : 'dashboard';
   document.getElementById('landing-screen').style.display='none';
@@ -1723,17 +1750,40 @@ function approvePlan(uid){
    condition que renderOwnDay() élimine la divergence pour TOUS les collaborateurs, y compris
    ceux dont l'état était déjà désynchronisé avant ce correctif (pas besoin de migration de
    données : la condition se recalcule à chaque appel). */
+/* CORRECTIF (écart signalé « stale PLAN_DAY ») : le contournement ci-dessous (status
+   'soumis'/'validé' ⇒ journée considérée démarrée) n'était scopé à AUCUNE fraîcheur de date.
+   Résultat concret constaté en test : un collaborateur qui ne clôture jamais explicitement sa
+   journée (pas de clic sur "Clôturer ma journée") garde indéfiniment PLAN_DAY/PLAN_STATUS de
+   son dernier jour "validé" — le lendemain (todayISO() a changé mais PLAN_DAY[u.id] non), les
+   DEUX branches de la fonction validaient encore : DAY_STARTED[u.id]===PLAN_DAY[u.id] (les deux
+   valeurs stagnent ensemble sur l'ancien jour) ET status==='validé'. dayStarted() renvoyait donc
+   `true` pour un jour qui n'était plus le jour courant : l'écran "Démarrer ma journée" ne
+   réapparaissait jamais, et toute nouvelle activité ajoutée (confirmAddActivity utilise
+   `PLAN_DAY[S.user.id] || todayISO()`) était silencieusement datée de la veille au lieu
+   d'aujourd'hui. On exige maintenant explicitement que le jour du plan (PLAN_DAY, ou aujourd'hui
+   à défaut) corresponde à todayISO() avant de considérer la journée comme démarrée — sinon c'est
+   un jour passé jamais clôturé et le collaborateur doit repasser par "Démarrer ma journée". */
 function dayStarted(u){
-  if(DAY_STARTED[u.id] === (PLAN_DAY[u.id] || todayISO())) return true;
+  const day = PLAN_DAY[u.id] || todayISO();
+  if(day !== todayISO()) return false;
+  if(DAY_STARTED[u.id] === day) return true;
   const status = PLAN_STATUS[u.id];
   return status==='soumis' || status==='validé';
 }
 function canStartDayNow(){ return nowTime() >= WORK_START; }
 function startMyDay(){
   if(!canStartDayNow()){ toast(`Ta journée démarre à ${WORK_START}.`); return; }
-  const day = PLAN_DAY[S.user.id] || todayISO();
+  /* Si PLAN_DAY pointe encore sur un jour passé (journée précédente jamais clôturée), démarrer
+     une nouvelle journée doit repartir sur une base propre pour AUJOURD'HUI plutôt que de
+     réutiliser cette date obsolète (voir le correctif de dayStarted() ci-dessus) : on réinitialise
+     alors le statut à "brouillon" pour ce nouveau jour. Les activités de l'ancien jour ne sont
+     pas perdues (elles restent en base, datées de ce jour-là) ; elles disparaissent simplement de
+     la vue "aujourd'hui", exactement comme après une clôture de journée explicite. */
+  const today = todayISO();
+  const stale = PLAN_DAY[S.user.id] && PLAN_DAY[S.user.id] !== today;
+  const day = stale ? today : (PLAN_DAY[S.user.id] || today);
   PLAN_DAY[S.user.id] = day;
-  if(!PLAN_STATUS[S.user.id]) PLAN_STATUS[S.user.id] = 'brouillon';
+  if(!PLAN_STATUS[S.user.id] || stale) PLAN_STATUS[S.user.id] = 'brouillon';
   DAY_STARTED[S.user.id] = day;
   render(); toast('Journée démarrée — tu peux maintenant ajouter tes activités.');
 }
@@ -1741,8 +1791,13 @@ function renderOwnDay(u, full){
   const status = PLAN_STATUS[u.id];
   const day = PLAN_DAY[u.id] || todayISO();
 
-  /* --- Étape 0 : JOURNÉE PAS ENCORE DÉMARRÉE — gate explicite sur la création d'activités --- */
-  if(u.role==='collab' && !dayStarted(u) && status!=='soumis' && status!=='validé'){
+  /* --- Étape 0 : JOURNÉE PAS ENCORE DÉMARRÉE — gate explicite sur la création d'activités ---
+     Le contournement "status soumis/validé" ne doit s'appliquer que si ce statut concerne
+     effectivement AUJOURD'HUI (day === todayISO()) : sinon c'est un jour passé jamais clôturé
+     (voir le correctif de dayStarted()) et l'écran "Démarrer ma journée" doit se réafficher pour
+     permettre de démarrer proprement la nouvelle journée. */
+  const isPlanDayFresh = day === todayISO();
+  if(u.role==='collab' && !dayStarted(u) && !(isPlanDayFresh && (status==='soumis' || status==='validé'))){
     const readyNow = canStartDayNow();
     return `
     <div class="card" style="text-align:center; padding:10px 0;">
@@ -2028,7 +2083,21 @@ function confirmAddActivity(){
   if(!title){ toast('Merci de renseigner un titre.'); return; }
   const projId = document.getElementById('naProj').value;
   const proj = PROJECTS.find(p=>p.id===projId);
-  const day = PLAN_DAY[S.user.id] || todayISO();
+  /* CORRECTIF (dates antérieures) : lire `PLAN_DAY[S.user.id] || todayISO()` ici supposait que
+     PLAN_DAY était forcément à jour pour QUICONQUE atteint ce point. C'est vrai pour un collaborateur
+     (le garde-fou ci-dessus passe par dayStarted(), qui exige déjà day===todayISO()) mais PAS pour un
+     responsable/admin : celui-ci n'a aucun écran "Démarrer ma journée" (le garde-fou ci-dessus est
+     scopé à role==='collab'), donc rien ne rafraîchit jamais PLAN_DAY[managerId] -- toute valeur qui
+     s'y retrouverait un jour (ex. via une évolution future du produit, ou une reprise de données)
+     resterait figée pour toujours et daterait silencieusement chaque nouvelle activité de ce
+     responsable avec un jour périmé. Une activité créée MAINTENANT doit toujours être datée
+     d'aujourd'hui, quel que soit ce que PLAN_DAY pourrait par ailleurs laisser penser : on
+     resynchronise donc PLAN_DAY[S.user.id] sur todayISO() ici, pour tous les rôles, avant de l'utiliser
+     -- au lieu de se fier passivement à sa fraîcheur. Pour un collaborateur c'est un no-op (déjà
+     garanti frais par dayStarted()) ; pour un responsable/admin, ça élimine la classe de bug à la
+     racine plutôt que de dépendre d'un garde-fou qui ne les couvre pas. */
+  const day = todayISO();
+  if(PLAN_DAY[S.user.id] !== day) PLAN_DAY[S.user.id] = day;
   /* Auto-réparation : si on est arrivé ici grâce au contournement "soumis/validé" de dayStarted()
      plutôt que via une correspondance stricte DAY_STARTED[u]===PLAN_DAY[u] (compte dont l'état
      était désynchronisé -- voir le commentaire de dayStarted()), on normalise DAY_STARTED
